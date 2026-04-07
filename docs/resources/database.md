@@ -117,7 +117,7 @@ Optional:
 - `admin_password` (String, Sensitive) A custom administrator account password (may only be set at creation time).
 - `admin_username` (String) A custom administrator account username (may only be set at creation time).
 - `backup_schedule` (String) The automated backup schedule (`HH:MM`).
-- `integrations` (Attributes List) ❗ Service integrations enabled when the service is created. At the moment only integrations where the current service is the destination are supported (e.g. a `read_replica` integration pointing at a source service). Updating this list forces the service to be recreated. (see [below for nested schema](#nestedatt--mysql--integrations))
+- `integrations` (Attributes Set) ❗ Service integrations enabled when the service is created. At the moment only integrations where the current service is the destination are supported (e.g. a `read_replica` integration pointing at a source service). Updating this set forces the service to be recreated. (see [below for nested schema](#nestedatt--mysql--integrations))
 - `ip_filter` (Set of String) A list of CIDR blocks to allow incoming connections from.
 - `mysql_settings` (String) MySQL configuration settings in JSON format (`exo dbaas type show mysql --settings=mysql` for reference).
 - `version` (String) MySQL major version (`exo dbaas type show mysql` for reference; may only be set at creation time).
@@ -187,7 +187,7 @@ Optional:
 - `admin_password` (String, Sensitive) A custom administrator account password (may only be set at creation time).
 - `admin_username` (String) A custom administrator account username (may only be set at creation time).
 - `backup_schedule` (String) The automated backup schedule (`HH:MM`).
-- `integrations` (Attributes List) ❗ Service integrations enabled when the service is created. At the moment only integrations where the current service is the destination are supported (e.g. a `read_replica` integration pointing at a source service). Updating this list forces the service to be recreated. (see [below for nested schema](#nestedatt--pg--integrations))
+- `integrations` (Attributes Set) ❗ Service integrations enabled when the service is created. At the moment only integrations where the current service is the destination are supported (e.g. a `read_replica` integration pointing at a source service). Updating this set forces the service to be recreated. (see [below for nested schema](#nestedatt--pg--integrations))
 - `ip_filter` (Set of String) A list of CIDR blocks to allow incoming connections from.
 - `pg_settings` (String) PostgreSQL configuration settings in JSON format (`exo dbaas type show pg --settings=pg` for reference).
 - `pgbouncer_settings` (String) PgBouncer configuration settings in JSON format (`exo dbaas type show pg --settings=pgbouncer` for reference).

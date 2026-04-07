@@ -6,29 +6,29 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 )
 
-// listRequiresReplaceModifier is a plan modifier that triggers resource
-// replacement whenever a list attribute changes.
+// setRequiresReplaceModifier is a plan modifier that triggers resource
+// replacement whenever a set attribute changes.
 //
-// The terraform-plugin-framework ships a `listplanmodifier.RequiresReplace`
+// The terraform-plugin-framework ships a `setplanmodifier.RequiresReplace`
 // helper upstream, but it is not vendored in this repository, so we provide a
 // minimal equivalent here.
-type listRequiresReplaceModifier struct{}
+type setRequiresReplaceModifier struct{}
 
-// listRequiresReplace returns a plan modifier that will force resource
-// replacement on any change to a list attribute.
-func listRequiresReplace() planmodifier.List {
-	return listRequiresReplaceModifier{}
+// setRequiresReplace returns a plan modifier that will force resource
+// replacement on any change to a set attribute.
+func setRequiresReplace() planmodifier.Set {
+	return setRequiresReplaceModifier{}
 }
 
-func (m listRequiresReplaceModifier) Description(_ context.Context) string {
+func (m setRequiresReplaceModifier) Description(_ context.Context) string {
 	return "If the value of this attribute changes, Terraform will destroy and recreate the resource."
 }
 
-func (m listRequiresReplaceModifier) MarkdownDescription(ctx context.Context) string {
+func (m setRequiresReplaceModifier) MarkdownDescription(ctx context.Context) string {
 	return m.Description(ctx)
 }
 
-func (m listRequiresReplaceModifier) PlanModifyList(_ context.Context, req planmodifier.ListRequest, resp *planmodifier.ListResponse) {
+func (m setRequiresReplaceModifier) PlanModifySet(_ context.Context, req planmodifier.SetRequest, resp *planmodifier.SetResponse) {
 	// Do not replace on resource creation.
 	if req.State.Raw.IsNull() {
 		return

@@ -15,6 +15,7 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/hashicorp/terraform-plugin-testing/helper/acctest"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/plancheck"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
 
 	exoapi "github.com/exoscale/egoscale/v2/api"
@@ -465,7 +466,9 @@ func CheckExistsPgDatabase(service, databaseName string, data *TemplateModelPgDb
 }
 
 // testResourcePgIntegrations exercises creating a PG service that is declared
-// as a read replica of another PG service via the `integrations` attribute.
+// as a read replica of another PG service via the `integrations` attribute,
+// and verifies that modifying the integration triggers a full replace of the
+// replica resource (since integrations cannot be updated in place).
 func testResourcePgIntegrations(t *testing.T) {
 	t.Parallel()
 
@@ -497,22 +500,76 @@ func testResourcePgIntegrations(t *testing.T) {
 		},
 	}
 
+	renderConfig := func(p TemplateModelPg, r TemplateModelPg) string {
+		buf := &bytes.Buffer{}
+		if err := serviceTpl.Execute(buf, &p); err != nil {
+			t.Fatal(err)
+		}
+		if err := serviceTpl.Execute(buf, &r); err != nil {
+			t.Fatal(err)
+		}
+		return buf.String()
+	}
+
+	configCreate := renderConfig(primary, replica)
+
+	// Second variant: add a second primary and swap the replica's
+	// source_service to point at it. Changing source_service must force the
+	// replica to be replaced (destroy+create).
+	primary2 := TemplateModelPg{
+		ResourceName:          "primary2",
+		Name:                  acctest.RandomWithPrefix(testutils.Prefix),
+		Plan:                  "hobbyist-2",
+		Zone:                  testutils.TestZoneName,
+		TerminationProtection: false,
+		Version:               "15",
+	}
+	replicaSwapped := replica
+	replicaSwapped.Integrations = []TemplateModelPgIntegration{
+		{
+			Type:          "read_replica",
+			SourceService: "exoscale_dbaas.primary2.name",
+		},
+	}
 	buf := &bytes.Buffer{}
 	if err := serviceTpl.Execute(buf, &primary); err != nil {
 		t.Fatal(err)
 	}
-	if err := serviceTpl.Execute(buf, &replica); err != nil {
+	if err := serviceTpl.Execute(buf, &primary2); err != nil {
 		t.Fatal(err)
 	}
-	configCreate := buf.String()
+	if err := serviceTpl.Execute(buf, &replicaSwapped); err != nil {
+		t.Fatal(err)
+	}
+	configSwap := buf.String()
 
 	primaryFullResourceName := "exoscale_dbaas.primary"
+	primary2FullResourceName := "exoscale_dbaas.primary2"
 	replicaFullResourceName := "exoscale_dbaas.replica"
+
+	integrationContains := func(primaryResource string) resource.TestCheckFunc {
+		return func(s *terraform.State) error {
+			primaryRes, ok := s.RootModule().Resources[primaryResource]
+			if !ok {
+				return fmt.Errorf("resource %s not found in state", primaryResource)
+			}
+			primaryName := primaryRes.Primary.Attributes["name"]
+			return resource.TestCheckTypeSetElemNestedAttrs(
+				replicaFullResourceName,
+				"pg.integrations.*",
+				map[string]string{
+					"type":           "read_replica",
+					"source_service": primaryName,
+				},
+			)(s)
+		}
+	}
 
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() { testutils.AccPreCheck(t) },
 		CheckDestroy: resource.ComposeAggregateTestCheckFunc(
 			CheckServiceDestroy("pg", primary.Name),
+			CheckServiceDestroy("pg", primary2.Name),
 			CheckServiceDestroy("pg", replica.Name),
 		),
 		ProtoV6ProviderFactories: testutils.TestAccProtoV6ProviderFactories,
@@ -523,13 +580,28 @@ func testResourcePgIntegrations(t *testing.T) {
 					resource.TestCheckResourceAttrSet(primaryFullResourceName, "created_at"),
 					resource.TestCheckResourceAttrSet(replicaFullResourceName, "created_at"),
 					resource.TestCheckResourceAttr(replicaFullResourceName, "pg.integrations.#", "1"),
-					resource.TestCheckResourceAttr(replicaFullResourceName, "pg.integrations.0.type", "read_replica"),
-					resource.TestCheckResourceAttrPair(
-						replicaFullResourceName, "pg.integrations.0.source_service",
-						primaryFullResourceName, "name",
-					),
+					integrationContains(primaryFullResourceName),
 					func(s *terraform.State) error {
 						return CheckPgIntegrationExists(replica.Name, primary.Name, "read_replica")
+					},
+				),
+			},
+			{
+				// Swapping source_service must force the replica to be
+				// replaced — verify via plancheck first, then assert the
+				// new integration is in place after apply.
+				Config: configSwap,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction(replicaFullResourceName, plancheck.ResourceActionReplace),
+					},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrSet(primary2FullResourceName, "created_at"),
+					resource.TestCheckResourceAttr(replicaFullResourceName, "pg.integrations.#", "1"),
+					integrationContains(primary2FullResourceName),
+					func(s *terraform.State) error {
+						return CheckPgIntegrationExists(replica.Name, primary2.Name, "read_replica")
 					},
 				),
 			},
