@@ -500,18 +500,18 @@ func testResourcePgIntegrations(t *testing.T) {
 		},
 	}
 
-	renderConfig := func(p TemplateModelPg, r TemplateModelPg) string {
+	renderPgConfig := func(services ...TemplateModelPg) string {
+		t.Helper()
 		buf := &bytes.Buffer{}
-		if err := serviceTpl.Execute(buf, &p); err != nil {
-			t.Fatal(err)
-		}
-		if err := serviceTpl.Execute(buf, &r); err != nil {
-			t.Fatal(err)
+		for _, s := range services {
+			if err := serviceTpl.Execute(buf, &s); err != nil {
+				t.Fatal(err)
+			}
 		}
 		return buf.String()
 	}
 
-	configCreate := renderConfig(primary, replica)
+	configCreate := renderPgConfig(primary, replica)
 
 	// Second variant: add a second primary and swap the replica's
 	// source_service to point at it. Changing source_service must force the
@@ -525,23 +525,16 @@ func testResourcePgIntegrations(t *testing.T) {
 		Version:               "15",
 	}
 	replicaSwapped := replica
+	// Rotate the replica name on the swap step so the destroy+create
+	// cycle does not hit a 409 on eventual-consistency in the DBaaS API.
+	replicaSwapped.Name = acctest.RandomWithPrefix(testutils.Prefix)
 	replicaSwapped.Integrations = []TemplateModelPgIntegration{
 		{
 			Type:          "read_replica",
 			SourceService: "exoscale_dbaas.primary2.name",
 		},
 	}
-	buf := &bytes.Buffer{}
-	if err := serviceTpl.Execute(buf, &primary); err != nil {
-		t.Fatal(err)
-	}
-	if err := serviceTpl.Execute(buf, &primary2); err != nil {
-		t.Fatal(err)
-	}
-	if err := serviceTpl.Execute(buf, &replicaSwapped); err != nil {
-		t.Fatal(err)
-	}
-	configSwap := buf.String()
+	configSwap := renderPgConfig(primary, primary2, replicaSwapped)
 
 	primaryFullResourceName := "exoscale_dbaas.primary"
 	primary2FullResourceName := "exoscale_dbaas.primary2"
@@ -554,6 +547,9 @@ func testResourcePgIntegrations(t *testing.T) {
 				return fmt.Errorf("resource %s not found in state", primaryResource)
 			}
 			primaryName := primaryRes.Primary.Attributes["name"]
+			if primaryName == "" {
+				return fmt.Errorf("resource %s has no `name` attribute in state", primaryResource)
+			}
 			return resource.TestCheckTypeSetElemNestedAttrs(
 				replicaFullResourceName,
 				"pg.integrations.*",
@@ -571,6 +567,7 @@ func testResourcePgIntegrations(t *testing.T) {
 			CheckServiceDestroy("pg", primary.Name),
 			CheckServiceDestroy("pg", primary2.Name),
 			CheckServiceDestroy("pg", replica.Name),
+			CheckServiceDestroy("pg", replicaSwapped.Name),
 		),
 		ProtoV6ProviderFactories: testutils.TestAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{
@@ -587,6 +584,21 @@ func testResourcePgIntegrations(t *testing.T) {
 				),
 			},
 			{
+				// Verify the import round-trip of the integrations
+				// attribute — the Read path's dest-filter is the
+				// most fragile part of the PR, so we exercise it
+				// explicitly. ImportStateVerify is disabled because
+				// other computed-or-optional pg attributes
+				// (admin_password, settings, ...) are not imported.
+				ResourceName: replicaFullResourceName,
+				ImportStateIdFunc: func() resource.ImportStateIdFunc {
+					return func(*terraform.State) (string, error) {
+						return fmt.Sprintf("%s@%s", replica.Name, replica.Zone), nil
+					}
+				}(),
+				ImportState: true,
+			},
+			{
 				// Swapping source_service must force the replica to be
 				// replaced — verify via plancheck first, then assert the
 				// new integration is in place after apply.
@@ -601,7 +613,7 @@ func testResourcePgIntegrations(t *testing.T) {
 					resource.TestCheckResourceAttr(replicaFullResourceName, "pg.integrations.#", "1"),
 					integrationContains(primary2FullResourceName),
 					func(s *terraform.State) error {
-						return CheckPgIntegrationExists(replica.Name, primary2.Name, "read_replica")
+						return CheckPgIntegrationExists(replicaSwapped.Name, primary2.Name, "read_replica")
 					},
 				),
 			},
@@ -618,6 +630,7 @@ func CheckPgIntegrationExists(dest, source, integrationType string) error {
 		return err
 	}
 
+	// terraform-plugin-testing TestCheckFunc has no context, so we make a fresh one.
 	ctx := exoapi.WithEndpoint(context.Background(), exoapi.NewReqEndpoint(testutils.TestEnvironment(), testutils.TestZoneName))
 
 	res, err := client.GetDbaasServicePgWithResponse(ctx, oapi.DbaasServiceName(dest))

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/setvalidator"
+	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
@@ -44,20 +45,24 @@ type ResourceDbaasIntegrationModel struct {
 	SourceService types.String `tfsdk:"source_service"`
 }
 
-// Types returns the attr.Type map for ResourceDbaasIntegrationModel, used to
-// build types.Set values for the `integrations` nested attribute.
-func (m ResourceDbaasIntegrationModel) Types() map[string]attr.Type {
-	return map[string]attr.Type{
-		"type":           types.StringType,
-		"source_service": types.StringType,
-	}
+// resourceDbaasIntegrationAttrTypes is the attr.Type map for a single
+// element in the `integrations` set.
+var resourceDbaasIntegrationAttrTypes = map[string]attr.Type{
+	"type":           types.StringType,
+	"source_service": types.StringType,
 }
 
 // resourceDbaasIntegrationObjectType is the attr.Type of a single element in
 // the `integrations` set.
-func resourceDbaasIntegrationObjectType() types.ObjectType {
-	return types.ObjectType{AttrTypes: ResourceDbaasIntegrationModel{}.Types()}
-}
+var resourceDbaasIntegrationObjectType = types.ObjectType{AttrTypes: resourceDbaasIntegrationAttrTypes}
+
+// supportedIntegrationTypes lists the integration type values accepted by
+// this provider when declared inline on a pg or mysql service. It is
+// intentionally narrow: the Exoscale DBaaS API supports additional
+// integration types (`logs`, `metrics`, `datasource`) via the standalone
+// integration endpoint, but those do not apply to the create-time
+// destination model exposed here.
+var supportedIntegrationTypes = []string{"read_replica"}
 
 var ResourcePgSchema = schema.SingleNestedAttribute{
 	Optional:            true,
@@ -117,19 +122,26 @@ var ResourcePgSchema = schema.SingleNestedAttribute{
 // modelled as a set so reordering by the API (on Read) doesn't produce
 // spurious plans.
 var ResourceDbaasIntegrationsSchema = schema.SetNestedAttribute{
-	MarkdownDescription: "❗ Service integrations enabled when the service is created. At the moment only integrations where the current service is the destination are supported (e.g. a `read_replica` integration pointing at a source service). Updating this set forces the service to be recreated.",
+	MarkdownDescription: "❗ Service integrations declared when the service is created. Only integrations where **this** resource is the destination are supported: for example, to create a PostgreSQL read replica, declare the `integrations` block on the replica (destination) and set `source_service` to the primary's name. Integrations cannot be updated in place — any change to this set destroys and recreates the service (including all data). Removing an integration out-of-band (e.g. via the Exoscale dashboard) will also trigger a forced replace on the next plan.",
 	Optional:            true,
+	Validators: []validator.Set{
+		setvalidator.SizeAtLeast(1),
+		integrationsSelfSource(),
+	},
 	PlanModifiers: []planmodifier.Set{
 		setRequiresReplace(),
 	},
 	NestedObject: schema.NestedAttributeObject{
 		Attributes: map[string]schema.Attribute{
 			"type": schema.StringAttribute{
-				MarkdownDescription: "❗ Integration type (e.g. `read_replica`).",
+				MarkdownDescription: "❗ Integration type. Currently only `read_replica` is supported.",
 				Required:            true,
+				Validators: []validator.String{
+					stringvalidator.OneOf(supportedIntegrationTypes...),
+				},
 			},
 			"source_service": schema.StringAttribute{
-				MarkdownDescription: "❗ Name of the source service to integrate with.",
+				MarkdownDescription: "❗ Name of the source service to integrate with. For a `read_replica` integration, this is the name of the primary service from which data is replicated.",
 				Required:            true,
 			},
 		},
@@ -565,7 +577,7 @@ func (r *ServiceResource) readPg(ctx context.Context, data *ServiceResourceModel
 	// Only surface integrations where the current service is the destination,
 	// so that Terraform state reflects exactly what the resource's config
 	// declares (i.e. integrations the user asked to create for this service).
-	data.Pg.Integrations = types.SetNull(resourceDbaasIntegrationObjectType())
+	data.Pg.Integrations = types.SetNull(resourceDbaasIntegrationObjectType)
 	if apiService.Integrations != nil {
 		var integrationModels []ResourceDbaasIntegrationModel
 		for _, integration := range *apiService.Integrations {
@@ -578,7 +590,7 @@ func (r *ServiceResource) readPg(ctx context.Context, data *ServiceResourceModel
 			})
 		}
 		if len(integrationModels) > 0 {
-			v, dg := types.SetValueFrom(ctx, resourceDbaasIntegrationObjectType(), integrationModels)
+			v, dg := types.SetValueFrom(ctx, resourceDbaasIntegrationObjectType, integrationModels)
 			if dg.HasError() {
 				diagnostics.Append(dg...)
 				return false
@@ -707,6 +719,12 @@ func (r *ServiceResource) updatePg(ctx context.Context, stateData *ServiceResour
 			stateData.Pg.PglookoutSettings = planData.Pg.PglookoutSettings
 			updated = true
 		}
+
+		// Defensive no-op: integrations is Optional with a RequiresReplace
+		// plan modifier, so Terraform Core never calls Update when the
+		// set differs from state. Keep stateData in sync with plan here
+		// as a safety net in case that contract is ever weakened.
+		stateData.Pg.Integrations = planData.Pg.Integrations
 	}
 
 	if !updated {

@@ -16,6 +16,7 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/hashicorp/terraform-plugin-testing/helper/acctest"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/plancheck"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
 
 	exoapi "github.com/exoscale/egoscale/v2/api"
@@ -41,6 +42,16 @@ type TemplateModelMysql struct {
 	IpFilter       []string
 	MysqlSettings  string
 	Version        string
+
+	Integrations []TemplateModelMysqlIntegration
+}
+
+// TemplateModelMysqlIntegration renders a single `integrations` block entry
+// in the mysql service template. SourceService is rendered as-is (so it may
+// be either a quoted literal or a resource reference).
+type TemplateModelMysqlIntegration struct {
+	Type          string
+	SourceService string
 }
 
 type TemplateModelMysqlUser struct {
@@ -442,4 +453,192 @@ func CheckExistsMysqlDatabase(service, databaseName string, data *TemplateModelM
 	}
 
 	return fmt.Errorf("could not find database %s for service %s, found %v", databaseName, service, serviceDbs)
+}
+
+// testResourceMysqlIntegrations exercises creating a MySQL service declared
+// as a read replica of another MySQL service via the `integrations`
+// attribute, and verifies that modifying the integration triggers a full
+// replace of the replica resource.
+func testResourceMysqlIntegrations(t *testing.T) {
+	t.Parallel()
+
+	serviceTpl, err := template.ParseFiles("testdata/resource_mysql.tmpl")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	primary := TemplateModelMysql{
+		ResourceName:          "primary",
+		Name:                  acctest.RandomWithPrefix(testutils.Prefix),
+		Plan:                  "hobbyist-2",
+		Zone:                  testutils.TestZoneName,
+		TerminationProtection: false,
+		Version:               "8",
+	}
+	replica := TemplateModelMysql{
+		ResourceName:          "replica",
+		Name:                  acctest.RandomWithPrefix(testutils.Prefix),
+		Plan:                  "hobbyist-2",
+		Zone:                  testutils.TestZoneName,
+		TerminationProtection: false,
+		Version:               "8",
+		Integrations: []TemplateModelMysqlIntegration{
+			{
+				Type:          "read_replica",
+				SourceService: "exoscale_dbaas.primary.name",
+			},
+		},
+	}
+
+	renderMysqlConfig := func(services ...TemplateModelMysql) string {
+		t.Helper()
+		buf := &bytes.Buffer{}
+		for _, s := range services {
+			if err := serviceTpl.Execute(buf, &s); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return buf.String()
+	}
+
+	configCreate := renderMysqlConfig(primary, replica)
+
+	// Second variant: add a second primary and swap the replica's
+	// source_service to point at it — must force replacement.
+	primary2 := TemplateModelMysql{
+		ResourceName:          "primary2",
+		Name:                  acctest.RandomWithPrefix(testutils.Prefix),
+		Plan:                  "hobbyist-2",
+		Zone:                  testutils.TestZoneName,
+		TerminationProtection: false,
+		Version:               "8",
+	}
+	replicaSwapped := replica
+	// Rotate the replica name on the swap step to avoid any 409
+	// eventual-consistency race on destroy+create against the same name.
+	replicaSwapped.Name = acctest.RandomWithPrefix(testutils.Prefix)
+	replicaSwapped.Integrations = []TemplateModelMysqlIntegration{
+		{
+			Type:          "read_replica",
+			SourceService: "exoscale_dbaas.primary2.name",
+		},
+	}
+	configSwap := renderMysqlConfig(primary, primary2, replicaSwapped)
+
+	primaryFullResourceName := "exoscale_dbaas.primary"
+	primary2FullResourceName := "exoscale_dbaas.primary2"
+	replicaFullResourceName := "exoscale_dbaas.replica"
+
+	integrationContains := func(primaryResource string) resource.TestCheckFunc {
+		return func(s *terraform.State) error {
+			primaryRes, ok := s.RootModule().Resources[primaryResource]
+			if !ok {
+				return fmt.Errorf("resource %s not found in state", primaryResource)
+			}
+			primaryName := primaryRes.Primary.Attributes["name"]
+			if primaryName == "" {
+				return fmt.Errorf("resource %s has no `name` attribute in state", primaryResource)
+			}
+			return resource.TestCheckTypeSetElemNestedAttrs(
+				replicaFullResourceName,
+				"mysql.integrations.*",
+				map[string]string{
+					"type":           "read_replica",
+					"source_service": primaryName,
+				},
+			)(s)
+		}
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() { testutils.AccPreCheck(t) },
+		CheckDestroy: resource.ComposeAggregateTestCheckFunc(
+			CheckServiceDestroy("mysql", primary.Name),
+			CheckServiceDestroy("mysql", primary2.Name),
+			CheckServiceDestroy("mysql", replica.Name),
+			CheckServiceDestroy("mysql", replicaSwapped.Name),
+		),
+		ProtoV6ProviderFactories: testutils.TestAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: configCreate,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrSet(primaryFullResourceName, "created_at"),
+					resource.TestCheckResourceAttrSet(replicaFullResourceName, "created_at"),
+					resource.TestCheckResourceAttr(replicaFullResourceName, "mysql.integrations.#", "1"),
+					integrationContains(primaryFullResourceName),
+					func(s *terraform.State) error {
+						return CheckMysqlIntegrationExists(replica.Name, primary.Name, "read_replica")
+					},
+				),
+			},
+			{
+				// Verify the import round-trip of the integrations attribute.
+				ResourceName: replicaFullResourceName,
+				ImportStateIdFunc: func() resource.ImportStateIdFunc {
+					return func(*terraform.State) (string, error) {
+						return fmt.Sprintf("%s@%s", replica.Name, replica.Zone), nil
+					}
+				}(),
+				ImportState: true,
+				// NOTE: ImportStateVerify is disabled because other
+				// computed-or-optional fields on the pg block (admin_password,
+				// settings) are not imported. The custom check asserts the
+				// integrations round-trip via the API.
+			},
+			{
+				// Swapping source_service must force the replica to be
+				// replaced — verified with plancheck before apply.
+				Config: configSwap,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction(replicaFullResourceName, plancheck.ResourceActionReplace),
+					},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrSet(primary2FullResourceName, "created_at"),
+					resource.TestCheckResourceAttr(replicaFullResourceName, "mysql.integrations.#", "1"),
+					integrationContains(primary2FullResourceName),
+					func(s *terraform.State) error {
+						return CheckMysqlIntegrationExists(replicaSwapped.Name, primary2.Name, "read_replica")
+					},
+				),
+			},
+		},
+	})
+}
+
+// CheckMysqlIntegrationExists verifies that the DBaaS API reports an
+// integration of the given type between source and dest (dest being the
+// service currently declared with the integration in its spec).
+func CheckMysqlIntegrationExists(dest, source, integrationType string) error {
+	client, err := testutils.APIClient()
+	if err != nil {
+		return err
+	}
+
+	// terraform-plugin-testing TestCheckFunc has no context, so we make a fresh one.
+	ctx := exoapi.WithEndpoint(context.Background(), exoapi.NewReqEndpoint(testutils.TestEnvironment(), testutils.TestZoneName))
+
+	res, err := client.GetDbaasServiceMysqlWithResponse(ctx, oapi.DbaasServiceName(dest))
+	if err != nil {
+		return err
+	}
+	if res.StatusCode() != http.StatusOK {
+		return fmt.Errorf("API request error: unexpected status %s", res.Status())
+	}
+	service := res.JSON200
+
+	if service.Integrations == nil {
+		return fmt.Errorf("no integrations reported for service %q", dest)
+	}
+	for _, integration := range *service.Integrations {
+		if integration.Dest == nil || integration.Source == nil || integration.Type == nil {
+			continue
+		}
+		if *integration.Dest == dest && *integration.Source == source && *integration.Type == integrationType {
+			return nil
+		}
+	}
+	return fmt.Errorf("integration %q from %q to %q not found on service %q", integrationType, source, dest, dest)
 }

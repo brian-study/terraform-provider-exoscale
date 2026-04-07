@@ -380,7 +380,7 @@ func (r *ServiceResource) readMysql(ctx context.Context, data *ServiceResourceMo
 	// Only surface integrations where the current service is the destination,
 	// so that Terraform state reflects exactly what the resource's config
 	// declares (i.e. integrations the user asked to create for this service).
-	data.Mysql.Integrations = types.SetNull(resourceDbaasIntegrationObjectType())
+	data.Mysql.Integrations = types.SetNull(resourceDbaasIntegrationObjectType)
 	if apiService.Integrations != nil {
 		var integrationModels []ResourceDbaasIntegrationModel
 		for _, integration := range *apiService.Integrations {
@@ -393,7 +393,7 @@ func (r *ServiceResource) readMysql(ctx context.Context, data *ServiceResourceMo
 			})
 		}
 		if len(integrationModels) > 0 {
-			v, dg := types.SetValueFrom(ctx, resourceDbaasIntegrationObjectType(), integrationModels)
+			v, dg := types.SetValueFrom(ctx, resourceDbaasIntegrationObjectType, integrationModels)
 			if dg.HasError() {
 				diagnostics.Append(dg...)
 				return false
@@ -496,6 +496,12 @@ func (r *ServiceResource) updateMysql(ctx context.Context, stateData *ServiceRes
 			stateData.Mysql.Settings = planData.Mysql.Settings
 			updated = true
 		}
+
+		// Defensive no-op: integrations is Optional with a RequiresReplace
+		// plan modifier, so Terraform Core never calls Update when the
+		// set differs from state. Keep stateData in sync with plan here
+		// as a safety net in case that contract is ever weakened.
+		stateData.Mysql.Integrations = planData.Mysql.Integrations
 	}
 
 	if !updated {

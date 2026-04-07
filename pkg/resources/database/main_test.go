@@ -23,6 +23,7 @@ func TestDatabase(t *testing.T) {
 	t.Run("ResourcePg", testResourcePg)
 	t.Run("ResourcePgIntegrations", testResourcePgIntegrations)
 	t.Run("ResourceMysql", testResourceMysql)
+	t.Run("ResourceMysqlIntegrations", testResourceMysqlIntegrations)
 	t.Run("ResourceValkey", testResourceValkey)
 	t.Run("ResourceKafka", testResourceKafka)
 	t.Run("ResourceOpensearch", testResourceOpensearch)
