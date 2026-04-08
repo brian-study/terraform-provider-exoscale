@@ -816,3 +816,87 @@ resource "exoscale_dbaas" "target" {
 		},
 	})
 }
+
+// testResourcePgStateUpgrade verifies that an existing operator with a
+// pg resource created by the previously-released provider version
+// (without the new `integrations` attribute) can cleanly refresh and
+// plan against this branch with no drift. This is the "existing
+// operators don't see surprise changes after upgrading the provider"
+// signal.
+//
+// The test uses terraform-plugin-testing's ExternalProviders to pin
+// step 1 to a released version, then swaps to the in-tree provider
+// via ProtoV6ProviderFactories. The framework handles the implicit
+// schema upgrade: the new `integrations` attribute is Optional with
+// no default, so state written by the old version should be decoded
+// with `integrations` populated as a null set, producing an empty
+// plan.
+func testResourcePgStateUpgrade(t *testing.T) {
+	t.Parallel()
+
+	name := acctest.RandomWithPrefix(testutils.Prefix)
+	// Config kept intentionally minimal: only required attributes plus
+	// version. Same config is used for all three steps so the only
+	// thing changing across steps is the provider binary.
+	config := fmt.Sprintf(`
+resource "exoscale_dbaas" "upgrade" {
+  name                   = %q
+  type                   = "pg"
+  plan                   = "hobbyist-2"
+  zone                   = %q
+  termination_protection = false
+  pg = {
+    version = "15"
+  }
+}
+`, name, testutils.TestZoneName)
+
+	resourceFullName := "exoscale_dbaas.upgrade"
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testutils.AccPreCheck(t) },
+		CheckDestroy: CheckServiceDestroy("pg", name),
+		Steps: []resource.TestStep{
+			{
+				// Step 1: create with the last-released provider
+				// version. State is written in that version's
+				// format; it has no `integrations` attribute in the
+				// pg block schema at all.
+				ExternalProviders: map[string]resource.ExternalProvider{
+					"exoscale": {
+						VersionConstraint: "= 0.68.0",
+						Source:            "exoscale/exoscale",
+					},
+				},
+				Config: config,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrSet(resourceFullName, "created_at"),
+					resource.TestCheckResourceAttr(resourceFullName, "name", name),
+				),
+			},
+			{
+				// Step 2: swap to the in-tree provider (which has
+				// the `integrations` attribute added). Refresh +
+				// plan must be a no-op — i.e. adding an optional
+				// nullable attribute does not cause drift on
+				// pre-existing state.
+				ProtoV6ProviderFactories: testutils.TestAccProtoV6ProviderFactories,
+				Config:                   config,
+				PlanOnly:                 true,
+				ExpectNonEmptyPlan:       false,
+			},
+			{
+				// Step 3: apply the same config under the in-tree
+				// provider. State is rewritten in the new format.
+				// Verify the new `integrations` attribute is
+				// absent (null) in the resulting state.
+				ProtoV6ProviderFactories: testutils.TestAccProtoV6ProviderFactories,
+				Config:                   config,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrSet(resourceFullName, "created_at"),
+					resource.TestCheckNoResourceAttr(resourceFullName, "pg.integrations.#"),
+				),
+			},
+		},
+	})
+}

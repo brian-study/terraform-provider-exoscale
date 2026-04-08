@@ -23,6 +23,7 @@ func TestDatabase(t *testing.T) {
 	t.Run("ResourcePg", testResourcePg)
 	t.Run("ResourcePgIntegrations", testResourcePgIntegrations)
 	t.Run("ResourcePgIntegrationsValidators", testResourcePgIntegrationsValidators)
+	t.Run("ResourcePgStateUpgrade", testResourcePgStateUpgrade)
 	t.Run("ResourceMysql", testResourceMysql)
 	t.Run("ResourceMysqlIntegrations", testResourceMysqlIntegrations)
 	t.Run("ResourceValkey", testResourceValkey)
