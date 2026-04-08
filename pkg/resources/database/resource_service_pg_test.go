@@ -477,10 +477,15 @@ func testResourcePgIntegrations(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Plan choice note: Exoscale DBaaS read replicas require the primary
+	// service to be on a Business or Premium plan (Hobbyist and Startup
+	// are not sufficient). The replica itself can run on any Startup or
+	// larger plan. `business-4` / `startup-4` is the cheapest authorized
+	// combination that actually supports the read_replica integration.
 	primary := TemplateModelPg{
 		ResourceName:          "primary",
 		Name:                  acctest.RandomWithPrefix(testutils.Prefix),
-		Plan:                  "hobbyist-2",
+		Plan:                  "business-4",
 		Zone:                  testutils.TestZoneName,
 		TerminationProtection: false,
 		Version:               "15",
@@ -488,7 +493,7 @@ func testResourcePgIntegrations(t *testing.T) {
 	replica := TemplateModelPg{
 		ResourceName:          "replica",
 		Name:                  acctest.RandomWithPrefix(testutils.Prefix),
-		Plan:                  "hobbyist-2",
+		Plan:                  "startup-4",
 		Zone:                  testutils.TestZoneName,
 		TerminationProtection: false,
 		Version:               "15",
@@ -519,7 +524,7 @@ func testResourcePgIntegrations(t *testing.T) {
 	primary2 := TemplateModelPg{
 		ResourceName:          "primary2",
 		Name:                  acctest.RandomWithPrefix(testutils.Prefix),
-		Plan:                  "hobbyist-2",
+		Plan:                  "business-4",
 		Zone:                  testutils.TestZoneName,
 		TerminationProtection: false,
 		Version:               "15",
