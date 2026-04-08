@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -592,9 +593,18 @@ func testResourcePgIntegrations(t *testing.T) {
 				// Verify the import round-trip of the integrations
 				// attribute — the Read path's dest-filter is the
 				// most fragile part of the PR, so we exercise it
-				// explicitly. ImportStateVerify is disabled because
-				// other computed-or-optional pg attributes
-				// (admin_password, settings, ...) are not imported.
+				// explicitly. ImportStateVerify (the usual helper) is
+				// not used because other computed-or-optional pg
+				// attributes (admin_password, settings, ...) don't
+				// round-trip. Instead we drive a custom
+				// ImportStateCheck that inspects the imported state
+				// and asserts only what this PR cares about:
+				//   - pg.integrations.# == "1"
+				//   - exactly one set element matches the expected
+				//     {type, source_service} pair
+				// This gives the panel-review-requested
+				// "import actually verifies integrations" signal
+				// without dragging in unrelated drift.
 				ResourceName: replicaFullResourceName,
 				ImportStateIdFunc: func() resource.ImportStateIdFunc {
 					return func(*terraform.State) (string, error) {
@@ -602,6 +612,12 @@ func testResourcePgIntegrations(t *testing.T) {
 					}
 				}(),
 				ImportState: true,
+				ImportStateCheck: assertImportedIntegrations(
+					"pg",
+					"read_replica",
+					&primary.Name,
+					1,
+				),
 			},
 			{
 				// Swapping source_service must force the replica to be
@@ -659,4 +675,144 @@ func CheckPgIntegrationExists(dest, source, integrationType string) error {
 		}
 	}
 	return fmt.Errorf("integration %q from %q to %q not found on service %q", integrationType, source, dest, dest)
+}
+
+// assertImportedIntegrations returns an ImportStateCheck callback that
+// inspects the imported state and asserts the nested `integrations`
+// attribute round-tripped with the expected count and at least one
+// element matching (type, *expectedSourceName). Works for both `pg.`
+// and `mysql.` top-level blocks — pass the dbType accordingly.
+//
+// Set nested attributes in flatmap state use hash-keyed element paths
+// (e.g. `pg.integrations.1234567890.type`), so we scan the Primary
+// attributes for the count key and any matching element.
+//
+// expectedSourceName is a pointer because the source name is not known
+// until the primary resource has been applied — the caller typically
+// passes &primary.Name, and Go closes over it; the pointer is
+// dereferenced lazily at import-check time.
+func assertImportedIntegrations(dbType, expectedType string, expectedSourceName *string, expectedCount int) resource.ImportStateCheckFunc {
+	return func(states []*terraform.InstanceState) error {
+		if len(states) == 0 {
+			return fmt.Errorf("no imported instance states returned")
+		}
+		state := states[0]
+
+		countKey := fmt.Sprintf("%s.integrations.#", dbType)
+		countStr, ok := state.Attributes[countKey]
+		if !ok {
+			return fmt.Errorf("imported state has no %q attribute", countKey)
+		}
+		if countStr != fmt.Sprintf("%d", expectedCount) {
+			return fmt.Errorf("imported state %s = %q, want %q", countKey, countStr, fmt.Sprintf("%d", expectedCount))
+		}
+
+		// Walk all hashed-set element paths, grouping by hash.
+		prefix := fmt.Sprintf("%s.integrations.", dbType)
+		seen := map[string]map[string]string{}
+		for k, v := range state.Attributes {
+			if !strings.HasPrefix(k, prefix) || k == countKey {
+				continue
+			}
+			rest := strings.TrimPrefix(k, prefix)
+			// rest looks like "<hash>.type" or "<hash>.source_service"
+			parts := strings.SplitN(rest, ".", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			hash, field := parts[0], parts[1]
+			if _, ok := seen[hash]; !ok {
+				seen[hash] = map[string]string{}
+			}
+			seen[hash][field] = v
+		}
+
+		want := *expectedSourceName
+		for hash, fields := range seen {
+			if fields["type"] == expectedType && fields["source_service"] == want {
+				return nil
+			}
+			_ = hash
+		}
+		return fmt.Errorf(
+			"imported state has no %s.integrations element with type=%q source_service=%q; got %d element(s): %+v",
+			dbType, expectedType, want, len(seen), seen,
+		)
+	}
+}
+
+// testResourcePgIntegrationsValidators exercises the attribute-level
+// validators on the `integrations` set: SizeAtLeast(1), OneOf("read_replica")
+// on `type`, and the custom self-source rejector. All steps are plan-only
+// with ExpectError regexps — no Exoscale resources are created, so the
+// test has zero API cost. Still routed through TestDatabase so it runs
+// alongside the existing AccPreCheck credentials gate.
+func testResourcePgIntegrationsValidators(t *testing.T) {
+	t.Parallel()
+
+	serviceName := acctest.RandomWithPrefix(testutils.Prefix)
+
+	// Minimal valid skeleton except for the integrations block we vary
+	// per step. The config references a non-existent primary service by
+	// name so terraform's dependency graph resolves without requiring a
+	// second resource — we only need validate/plan to run.
+	//
+	// `zone` is a real authorized zone so the zone OneOf validator passes;
+	// the resource never reaches the Create RPC because the integrations
+	// validator fires first.
+	configWithIntegrations := func(name string, integrationsBlock string) string {
+		return fmt.Sprintf(`
+resource "exoscale_dbaas" "target" {
+  name = %q
+  type = "pg"
+  plan = "business-4"
+  zone = %q
+  pg = {
+    version = "15"
+    %s
+  }
+}
+`, name, testutils.TestZoneName, integrationsBlock)
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testutils.AccPreCheck(t) },
+		ProtoV6ProviderFactories: testutils.TestAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				// setvalidator.SizeAtLeast(1) — empty set must be rejected
+				// at plan time so users don't hit a perpetual diff.
+				Config:   configWithIntegrations(serviceName, `integrations = []`),
+				PlanOnly: true,
+				ExpectError: regexp.MustCompile(
+					`(?s)set must contain at least 1 elements`,
+				),
+			},
+			{
+				// stringvalidator.OneOf("read_replica") on `type`.
+				Config: configWithIntegrations(serviceName, `integrations = [{
+      type           = "logs"
+      source_service = "some-other-service"
+    }]`),
+				PlanOnly: true,
+				ExpectError: regexp.MustCompile(
+					`(?s)value must be one of.*read_replica.*got: "logs"`,
+				),
+			},
+			{
+				// Custom integrationsSelfSource validator — refuse an
+				// integration whose source_service equals the resource's
+				// own name. Catches copy-paste mistakes at plan time
+				// instead of after a slow failed API call.
+				Config: configWithIntegrations(serviceName, fmt.Sprintf(`integrations = [{
+      type           = "read_replica"
+      source_service = %q
+    }]`, serviceName)),
+				PlanOnly: true,
+				ExpectError: regexp.MustCompile(
+					`(?s)Invalid integration source`,
+				),
+			},
+		},
+	})
 }

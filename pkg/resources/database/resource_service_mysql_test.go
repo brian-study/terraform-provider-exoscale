@@ -578,7 +578,9 @@ func testResourceMysqlIntegrations(t *testing.T) {
 				),
 			},
 			{
-				// Verify the import round-trip of the integrations attribute.
+				// Verify the import round-trip of the integrations
+				// attribute. See the pg test for rationale; uses the
+				// shared assertImportedIntegrations helper.
 				ResourceName: replicaFullResourceName,
 				ImportStateIdFunc: func() resource.ImportStateIdFunc {
 					return func(*terraform.State) (string, error) {
@@ -586,10 +588,12 @@ func testResourceMysqlIntegrations(t *testing.T) {
 					}
 				}(),
 				ImportState: true,
-				// NOTE: ImportStateVerify is disabled because other
-				// computed-or-optional fields on the pg block (admin_password,
-				// settings) are not imported. The custom check asserts the
-				// integrations round-trip via the API.
+				ImportStateCheck: assertImportedIntegrations(
+					"mysql",
+					"read_replica",
+					&primary.Name,
+					1,
+				),
 			},
 			{
 				// Swapping source_service must force the replica to be
