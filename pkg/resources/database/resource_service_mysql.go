@@ -16,6 +16,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
 
+	exoscale "github.com/exoscale/egoscale/v2"
 	apiv2 "github.com/exoscale/egoscale/v2/api"
 	"github.com/exoscale/egoscale/v2/oapi"
 
@@ -193,6 +194,36 @@ func (r *ServiceResource) createMysql(ctx context.Context, data *ServiceResource
 		return
 	}
 
+	// The service now exists on Exoscale. Any error return after
+	// this point must delete it first — otherwise we orphan a
+	// billable database service that Terraform state never knew
+	// about. See createPg for the full rationale.
+	createSucceeded := false
+	defer func() {
+		if createSucceeded {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		cleanupCtx = apiv2.WithEndpoint(cleanupCtx, apiv2.NewReqEndpoint(r.env, data.Zone.ValueString()))
+		name := data.Id.ValueString()
+		if delErr := r.client.DeleteDatabaseService(
+			cleanupCtx,
+			data.Zone.ValueString(),
+			&exoscale.DatabaseService{Name: &name},
+		); delErr != nil {
+			tflog.Warn(ctx, fmt.Sprintf(
+				"orphan cleanup failed after createMysql error for service %q: %v",
+				name, delErr,
+			))
+		} else {
+			tflog.Info(ctx, fmt.Sprintf(
+				"orphan cleanup: deleted partially-created mysql service %q",
+				name,
+			))
+		}
+	}()
+
 	tflog.Info(ctx, "DB Service created, waiting for the service to be in 'running' state")
 
 	apiService := &oapi.DbaasServiceMysql{}
@@ -329,6 +360,10 @@ pooling:
 			}
 		}
 	}
+
+	// All post-create population succeeded — cancel the deferred
+	// orphan cleanup.
+	createSucceeded = true
 }
 
 // readMysql function handles MySQL specific part of database resource Read logic.

@@ -19,6 +19,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
 
+	exoscale "github.com/exoscale/egoscale/v2"
 	apiv2 "github.com/exoscale/egoscale/v2/api"
 	"github.com/exoscale/egoscale/v2/oapi"
 
@@ -298,6 +299,39 @@ func (r *ServiceResource) createPg(ctx context.Context, data *ServiceResourceMod
 		return
 	}
 
+	// The service now exists on Exoscale. Any error return after this
+	// point must delete it first — otherwise we orphan a billable
+	// database service that Terraform state never knew about, which
+	// cannot be cleaned up by CheckDestroy, taint, or any normal
+	// workflow. Cleanup uses a fresh, bounded context detached from
+	// the request ctx (which may already be cancelled if we got here
+	// via ctx.Done()).
+	createSucceeded := false
+	defer func() {
+		if createSucceeded {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		cleanupCtx = apiv2.WithEndpoint(cleanupCtx, apiv2.NewReqEndpoint(r.env, data.Zone.ValueString()))
+		name := data.Id.ValueString()
+		if delErr := r.client.DeleteDatabaseService(
+			cleanupCtx,
+			data.Zone.ValueString(),
+			&exoscale.DatabaseService{Name: &name},
+		); delErr != nil {
+			tflog.Warn(ctx, fmt.Sprintf(
+				"orphan cleanup failed after createPg error for service %q: %v",
+				name, delErr,
+			))
+		} else {
+			tflog.Info(ctx, fmt.Sprintf(
+				"orphan cleanup: deleted partially-created pg service %q",
+				name,
+			))
+		}
+	}()
+
 	tflog.Info(ctx, "DB Service created, waiting for the service to be in 'running' state")
 	apiService := &oapi.DbaasServicePg{}
 pooling:
@@ -457,6 +491,11 @@ pooling:
 			}
 		}
 	}
+
+	// All post-create population succeeded — cancel the deferred
+	// orphan cleanup. Any panic between here and the return still
+	// allows the defer to run.
+	createSucceeded = true
 }
 
 // readPg function handles PostgreSQL specific part of database resource Read logic.
