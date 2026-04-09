@@ -726,16 +726,21 @@ func testResourcePgIntegrations(t *testing.T) {
 				// configSwapNoIntegrations variant.
 				//
 				// The replica declares `depends_on =
-				// [exoscale_dbaas.primary2]` because omitting
-				// `integrations` also removes the implicit
-				// Terraform dependency edge from the replica to
-				// primary2; without the explicit depends_on,
-				// terraform destroy would race primary2 against
-				// the replica and fail with "Cannot delete ...
-				// while read replica exists". This matches the
-				// guidance now emitted by the
-				// integrationsDependencyWarning plan modifier
-				// and documented in the schema description.
+				// [exoscale_dbaas.primary2]` to restore destroy
+				// ordering after removing the implicit
+				// dependency edge that the integrations block
+				// would normally provide. This is a PARTIAL
+				// mitigation: it lets the post-test destroy
+				// complete cleanly, but it does NOT handle
+				// source replacement (changing primary2's name
+				// or plan would NOT trigger a replica
+				// replacement, because depends_on only affects
+				// ordering and not replacement propagation).
+				// The schema description documents this
+				// limitation and points operators at declaring
+				// integrations explicitly as the only complete
+				// fix; this test step deliberately exercises
+				// the limited-mitigation path.
 				//
 				// ExpectNonEmptyPlan: true accounts for
 				// pre-existing drift on other Optional+Computed
@@ -745,10 +750,7 @@ func testResourcePgIntegrations(t *testing.T) {
 				// PreApply plancheck asserts the action is
 				// Update (not Replace), and the Check asserts
 				// the integration is still present in state
-				// after apply. The
-				// integrationsDependencyWarning plan modifier
-				// fires on this step; warnings do not fail test
-				// assertions.
+				// after apply.
 				Config: configSwapNoIntegrations,
 				ConfigPlanChecks: resource.ConfigPlanChecks{
 					PreApply: []plancheck.PlanCheck{

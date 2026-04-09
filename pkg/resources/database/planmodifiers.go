@@ -15,7 +15,6 @@ import (
 var (
 	_ planmodifier.Set = setRequiresReplaceModifier{}
 	_ planmodifier.Set = setUseStateForUnknownModifier{}
-	_ planmodifier.Set = integrationsDependencyWarningModifier{}
 )
 
 // setUseStateForUnknownModifier copies the state value into the plan when
@@ -65,65 +64,6 @@ func (m setUseStateForUnknownModifier) PlanModifySet(_ context.Context, req plan
 	}
 
 	resp.PlanValue = req.StateValue
-}
-
-// integrationsDependencyWarningModifier emits an attribute-level warning
-// when state has integrations but configuration does not declare them.
-// This pairs with the Optional+Computed+UseStateForUnknown pattern used
-// by the `integrations` attribute: omitting the block avoids a
-// destructive refresh-time replace, but also removes the implicit
-// Terraform dependency edge between the replica and its source service.
-// The warning tells the operator how to restore the edge (depends_on or
-// explicit configuration).
-type integrationsDependencyWarningModifier struct{}
-
-// integrationsDependencyWarning returns a plan modifier that warns when
-// the `integrations` set is populated in state but not declared in
-// configuration.
-func integrationsDependencyWarning() planmodifier.Set {
-	return integrationsDependencyWarningModifier{}
-}
-
-func (m integrationsDependencyWarningModifier) Description(_ context.Context) string {
-	return "Warns when the integrations set is present in state but not declared in configuration, to prompt the operator to add an explicit depends_on."
-}
-
-func (m integrationsDependencyWarningModifier) MarkdownDescription(ctx context.Context) string {
-	return m.Description(ctx)
-}
-
-func (m integrationsDependencyWarningModifier) PlanModifySet(_ context.Context, req planmodifier.SetRequest, resp *planmodifier.SetResponse) {
-	// Only warn when state has a concrete value AND the operator has
-	// not declared the attribute in configuration. Unknown state or
-	// unknown config means the framework is still resolving values —
-	// not our moment to warn.
-	if req.StateValue.IsNull() || req.StateValue.IsUnknown() {
-		return
-	}
-	if !req.ConfigValue.IsNull() {
-		return
-	}
-
-	resp.Diagnostics.AddAttributeWarning(
-		req.Path,
-		"`integrations` is populated in state but not declared in configuration",
-		"The `integrations` attribute on this resource has values in state (read "+
-			"from the Exoscale API), but the Terraform configuration does not "+
-			"declare the `integrations` block. Refresh and plan are safe — the "+
-			"state value is preserved via `UseStateForUnknown` — but this "+
-			"removes the implicit Terraform dependency edge from this resource "+
-			"to its source service, because the dependency graph is built from "+
-			"configuration references, not from state.\n\n"+
-			"If the source service is also managed by Terraform in this state, "+
-			"add an explicit dependency on this resource:\n\n"+
-			"    depends_on = [exoscale_dbaas.<source>]\n\n"+
-			"Otherwise `terraform destroy` (and any operation that replaces "+
-			"the source service) may attempt to delete the source before the "+
-			"replica and fail with \"Cannot delete ... while read replica exists\".\n\n"+
-			"Alternatively, declare the `integrations` block explicitly in "+
-			"configuration. That preserves the dependency edge automatically "+
-			"and silences this warning.",
-	)
 }
 
 // setRequiresReplaceModifier is a plan modifier that triggers resource

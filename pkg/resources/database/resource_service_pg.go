@@ -131,9 +131,23 @@ var ResourcePgSchema = schema.SingleNestedAttribute{
 // to the state value in that case, producing a no-op plan. The
 // `RequiresReplace` modifier still fires when the operator actively
 // changes a configured integration.
+//
+// NOTE on the limits of omission: when the operator omits the attribute,
+// the provider can only keep refresh and plan stable. It CANNOT preserve
+// Terraform's dependency graph — dependency edges come from configuration
+// references, not from state — so `terraform destroy` and source
+// replacement are NOT fully handled by the provider in that case. The
+// only pattern that handles all lifecycle events correctly is declaring
+// the `integrations` block explicitly in configuration, with a reference
+// like `source_service = exoscale_dbaas.<primary>.name`. The schema
+// description spells this out for operators.
 var ResourceDbaasIntegrationsSchema = schema.SetNestedAttribute{
 	MarkdownDescription: "❗ Service integrations declared when the service is created. Only integrations where **this** resource is the destination are supported: for example, to create a PostgreSQL read replica, declare the `integrations` block on the replica (destination) and set `source_service` to the primary's name. Integrations cannot be updated in place — any change to this set destroys and recreates the service (including all data).\n\n" +
-		"**Important — omitting the attribute:** On an imported or pre-existing replica, omitting `integrations` from configuration avoids a spurious forced-replace on refresh (the value is read from the API and preserved in state). However, it also **removes the implicit Terraform dependency edge from the replica to the source service**, because Terraform builds the dependency graph from configuration references, not from state. If the source service is also managed by Terraform in this state, you **must** add an explicit `depends_on = [exoscale_dbaas.<source>]` on this resource, or `terraform destroy` (and any operation that replaces the source) may attempt to delete the source before the replica and fail with `Cannot delete ... while read replica exists`. The same caveat applies when the source is replaced for any other reason. Declaring the `integrations` block explicitly is the simplest alternative: it both preserves the dependency edge and makes the relationship visible in configuration.\n\n" +
+		"**Declaring the block explicitly is the recommended pattern** when the source service is also managed by Terraform. A configuration reference such as `source_service = exoscale_dbaas.<primary>.name` creates the dependency edge Terraform needs for every lifecycle event: when the primary is replaced, the replica's `source_service` changes with it, the replica is replaced in the correct order, and the old source can be deleted cleanly. This is the only pattern that handles refresh, plan, destroy, AND source replacement correctly.\n\n" +
+		"**Omitting the attribute is safe for refresh and plan only.** On an imported or pre-existing replica, leaving `integrations` out of configuration avoids a spurious forced-replace on refresh (the value is read from the API and preserved in state via `UseStateForUnknown`). However, it removes the Terraform dependency edge, so:\n\n" +
+		"- `terraform destroy` may attempt to delete the source before the replica and fail with `Cannot delete ... while read replica exists`. Adding `depends_on = [exoscale_dbaas.<source>]` on the replica restores destroy ordering for **whole-stack destroys only**.\n" +
+		"- Replacing the source (rename, zone change, plan change, etc.) does **not** trigger a corresponding replacement of the replica, because Terraform sees no configuration change on the replica. `depends_on` does not fix this — it only affects ordering, not replacement propagation. There is no provider-level workaround for this case; declaring `integrations` explicitly in configuration is the only complete fix.\n\n" +
+		"Omitting the attribute is fully safe when the source service is **not** managed by Terraform in the same state (e.g. an external primary created out-of-band), because there is no dependency graph to preserve.\n\n" +
 		"Removing an integration out-of-band (e.g. via the Exoscale dashboard) on a resource that explicitly declares the attribute in configuration still triggers a forced replace on the next plan.",
 	Optional: true,
 	Computed: true,
@@ -143,7 +157,6 @@ var ResourceDbaasIntegrationsSchema = schema.SetNestedAttribute{
 	},
 	PlanModifiers: []planmodifier.Set{
 		setUseStateForUnknown(),
-		integrationsDependencyWarning(),
 		setRequiresReplace(),
 	},
 	NestedObject: schema.NestedAttributeObject{

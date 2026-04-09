@@ -634,7 +634,10 @@ func testResourceMysqlIntegrations(t *testing.T) {
 				// P1 regression: omit `integrations` from the
 				// replica's config entirely. Mirrors the equivalent
 				// pg step — see testResourcePgIntegrations for full
-				// rationale. Verifies the Optional+Computed+
+				// rationale, including the caveat that
+				// `depends_on` is only a partial mitigation for
+				// destroy ordering and does not handle source
+				// replacement. Verifies the Optional+Computed+
 				// UseStateForUnknown fix applies symmetrically to
 				// mysql: the plan action on the replica is Update
 				// (not Replace), and the post-apply state still
@@ -644,9 +647,6 @@ func testResourceMysqlIntegrations(t *testing.T) {
 				// drift on other Optional+Computed mysql attributes
 				// that lack UseStateForUnknown modifiers. The
 				// PreApply plancheck asserts Update (not Replace).
-				// The integrationsDependencyWarning plan modifier
-				// fires on this step — warnings do not fail the
-				// test assertions.
 				Config: configSwapNoIntegrations,
 				ConfigPlanChecks: resource.ConfigPlanChecks{
 					PreApply: []plancheck.PlanCheck{
