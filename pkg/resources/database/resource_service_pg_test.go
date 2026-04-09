@@ -1056,31 +1056,32 @@ resource "exoscale_dbaas" "target" {
 // testResourcePgIntegrationsUnknownSource verifies that the
 // integrationsSelfSource validator (and the underlying ElementsAs
 // decoding in createPg) do not produce a spurious plan-time error
-// when an integration element's source_service references a computed
-// attribute of another resource that has not been applied yet. In
-// that case the plan-time value of source_service is unknown, and
-// the validator must skip the element rather than fail the plan.
+// when an integration element's source_service is unknown at plan
+// time. In that case the validator must skip the element rather than
+// fail the plan, and ElementsAs must decode without erroring.
 //
-// Plan-only test using two exoscale_dbaas resources in the same
-// config. At plan time neither exists yet, so primary.id (a
-// Computed attribute) is unknown, and so is the replica's
-// integrations[*].source_service. Zero API cost — the plan is
-// computed locally and never applied.
+// The unknown value comes from a built-in `terraform_data` resource
+// whose `output` attribute is Computed and therefore unknown before
+// apply. We deliberately do NOT use a reference to another
+// exoscale_dbaas resource's Computed attributes (such as `.id`):
+// per the schema documentation, `source_service` must resolve to a
+// plan-time-known value like `.name`, because Computed attributes
+// on exoscale_dbaas carry a `UseStateForUnknown` plan modifier that
+// would make source replacement unsafe. The validator itself does
+// not distinguish between "unknown because the source is being
+// created" and "unknown because the operator used the wrong kind of
+// reference", but the test suite should not imply that referencing
+// `.id` is a supported pattern.
+//
+// Plan-only test. Zero API cost — the plan is computed locally and
+// never applied.
 func testResourcePgIntegrationsUnknownSource(t *testing.T) {
 	t.Parallel()
 
-	primaryName := acctest.RandomWithPrefix(testutils.Prefix)
 	replicaName := acctest.RandomWithPrefix(testutils.Prefix)
 	config := fmt.Sprintf(`
-resource "exoscale_dbaas" "p2_primary" {
-  name                   = %q
-  type                   = "pg"
-  plan                   = "business-4"
-  zone                   = %q
-  termination_protection = false
-  pg = {
-    version = "15"
-  }
+resource "terraform_data" "unknown_source" {
+  input = "placeholder"
 }
 
 resource "exoscale_dbaas" "p2_replica" {
@@ -1093,13 +1094,17 @@ resource "exoscale_dbaas" "p2_replica" {
     version = "15"
     integrations = [{
       type = "read_replica"
-      # id is Computed, unknown until p2_primary is applied. The
-      # validator must skip the element instead of erroring.
-      source_service = exoscale_dbaas.p2_primary.id
+      # terraform_data.unknown_source.output is Computed; its value
+      # is unknown at plan time before any apply. This exercises
+      # the validator's "skip element with unknown field" path
+      # without referencing a Computed attribute on exoscale_dbaas
+      # itself (which would endorse an unsupported pattern — see
+      # the ResourceDbaasIntegrationsSchema description).
+      source_service = terraform_data.unknown_source.output
     }]
   }
 }
-`, primaryName, testutils.TestZoneName, replicaName, testutils.TestZoneName)
+`, replicaName, testutils.TestZoneName)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { testutils.AccPreCheck(t) },
