@@ -130,6 +130,8 @@ integrations = [{
 
 `.name` is **required** in the source's configuration, so its value is resolved from configuration at plan time and changes propagate through Terraform's dependency graph. When the primary's name changes (or the primary is replaced for any reason), the replica's `source_service` value changes with it, the `setRequiresReplace` plan modifier fires, and the replica is replaced in the correct order. This is the only pattern that handles refresh, plan, destroy, AND source replacement correctly.
 
+Computed-name workflows (e.g. `name = "${random_id.suffix.hex}-primary"`) are supported: Terraform will normally resolve the primary's name before the replica's create call runs, and the reference is passed through unchanged. In the rare case that the value is still unknown at create time, the provider rejects the create with a clear error naming the `source_service` element, rather than silently submitting an empty value to the API.
+
 **Do not reference `Computed` attributes of the source service — notably `.id`, but also `.created_at`, `.state`, and similar — for `source_service`.** These attributes carry a `UseStateForUnknown` plan modifier that copies the prior state value into the plan during a source replacement. That suppresses the `setRequiresReplace` diff on the replica, leaves the replica attached to the destroyed source, and causes `terraform apply` to fail with `Cannot delete ... while read replica exists`. Always use a reference whose value is determined by configuration, not by post-apply computation — in practice, that means `.name`.
 
 **Omitting the attribute is safe for refresh and plan only.** On an imported or pre-existing replica, leaving `integrations` out of configuration avoids a spurious forced-replace on refresh (the value is read from the API and preserved in state via `UseStateForUnknown`). However, it removes the Terraform dependency edge, so:
@@ -221,6 +223,8 @@ integrations = [{
 ```
 
 `.name` is **required** in the source's configuration, so its value is resolved from configuration at plan time and changes propagate through Terraform's dependency graph. When the primary's name changes (or the primary is replaced for any reason), the replica's `source_service` value changes with it, the `setRequiresReplace` plan modifier fires, and the replica is replaced in the correct order. This is the only pattern that handles refresh, plan, destroy, AND source replacement correctly.
+
+Computed-name workflows (e.g. `name = "${random_id.suffix.hex}-primary"`) are supported: Terraform will normally resolve the primary's name before the replica's create call runs, and the reference is passed through unchanged. In the rare case that the value is still unknown at create time, the provider rejects the create with a clear error naming the `source_service` element, rather than silently submitting an empty value to the API.
 
 **Do not reference `Computed` attributes of the source service — notably `.id`, but also `.created_at`, `.state`, and similar — for `source_service`.** These attributes carry a `UseStateForUnknown` plan modifier that copies the prior state value into the plan during a source replacement. That suppresses the `setRequiresReplace` diff on the replica, leaves the replica attached to the destroyed source, and causes `terraform apply` to fail with `Cannot delete ... while read replica exists`. Always use a reference whose value is determined by configuration, not by post-apply computation — in practice, that means `.name`.
 

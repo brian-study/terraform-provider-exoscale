@@ -161,6 +161,7 @@ var ResourceDbaasIntegrationsSchema = schema.SetNestedAttribute{
 		"}]\n" +
 		"```\n\n" +
 		"`.name` is **required** in the source's configuration, so its value is resolved from configuration at plan time and changes propagate through Terraform's dependency graph. When the primary's name changes (or the primary is replaced for any reason), the replica's `source_service` value changes with it, the `setRequiresReplace` plan modifier fires, and the replica is replaced in the correct order. This is the only pattern that handles refresh, plan, destroy, AND source replacement correctly.\n\n" +
+		"Computed-name workflows (e.g. `name = \"${random_id.suffix.hex}-primary\"`) are supported: Terraform will normally resolve the primary's name before the replica's create call runs, and the reference is passed through unchanged. In the rare case that the value is still unknown at create time, the provider rejects the create with a clear error naming the `source_service` element, rather than silently submitting an empty value to the API.\n\n" +
 		"**Do not reference `Computed` attributes of the source service — notably `.id`, but also `.created_at`, `.state`, and similar — for `source_service`.** These attributes carry a `UseStateForUnknown` plan modifier that copies the prior state value into the plan during a source replacement. That suppresses the `setRequiresReplace` diff on the replica, leaves the replica attached to the destroyed source, and causes `terraform apply` to fail with `Cannot delete ... while read replica exists`. Always use a reference whose value is determined by configuration, not by post-apply computation — in practice, that means `.name`.\n\n" +
 		"**Omitting the attribute is safe for refresh and plan only.** On an imported or pre-existing replica, leaving `integrations` out of configuration avoids a spurious forced-replace on refresh (the value is read from the API and preserved in state via `UseStateForUnknown`). However, it removes the Terraform dependency edge, so:\n\n" +
 		"- `terraform destroy` may attempt to delete the source before the replica and fail with `Cannot delete ... while read replica exists`. Adding `depends_on = [exoscale_dbaas.<source>]` on the replica restores destroy ordering for **whole-stack destroys only**.\n" +
@@ -301,6 +302,57 @@ func (r *ServiceResource) createPg(ctx context.Context, data *ServiceResourceMod
 			if dg := data.Pg.Integrations.ElementsAs(ctx, &integrationModels, true); dg.HasError() {
 				diagnostics.Append(dg...)
 				return
+			}
+			// Defensive check: the attribute-level validator is
+			// lenient about unknown nested values at plan time
+			// because interpolations like
+			// `source_service = exoscale_dbaas.<primary>.name`
+			// (where the primary's name is itself computed from
+			// e.g. a random_id) are normally resolved by the
+			// time `createPg` runs, thanks to Terraform's
+			// dependency ordering. But the plugin protocol does
+			// NOT guarantee this: per tfprotov6 documentation,
+			// "any unknown values may remain unknown" in the
+			// apply-time planned state. If that happens,
+			// `types.String.ValueString()` returns "" for
+			// unknown values, and we would silently submit
+			// `source-service=""` to the Exoscale API, which
+			// then fails with an opaque error. Reject the
+			// create cleanly instead.
+			for i, integration := range integrationModels {
+				if integration.Type.IsNull() || integration.Type.IsUnknown() {
+					diagnostics.AddError(
+						"pg.integrations: element type is unknown or null at create time",
+						fmt.Sprintf(
+							"Element %d of the `pg.integrations` set has no concrete "+
+								"`type` value at the time the service is being created. "+
+								"This usually means `type` depends on a computed value "+
+								"that Terraform could not resolve before the service create "+
+								"call. Set `type` to a literal value (currently only "+
+								"\"read_replica\" is supported).",
+							i,
+						),
+					)
+					return
+				}
+				if integration.SourceService.IsNull() || integration.SourceService.IsUnknown() {
+					diagnostics.AddError(
+						"pg.integrations: source_service is unknown or null at create time",
+						fmt.Sprintf(
+							"Element %d of the `pg.integrations` set has no concrete "+
+								"`source_service` value at the time the service is being "+
+								"created. This usually means `source_service` references a "+
+								"value that Terraform could not resolve before the create "+
+								"call — for example, a primary service whose name is itself "+
+								"computed from another resource that has not been applied "+
+								"yet. Ensure `source_service` references a plan-time-known "+
+								"value, typically `exoscale_dbaas.<primary>.name` where the "+
+								"primary's name is a literal or a fully-resolved expression.",
+							i,
+						),
+					)
+					return
+				}
 			}
 			if len(integrationModels) > 0 {
 				integrations := make([]struct {

@@ -163,6 +163,52 @@ func (r *ServiceResource) createMysql(ctx context.Context, data *ServiceResource
 				diagnostics.Append(dg...)
 				return
 			}
+			// Defensive check: see createPg for the full rationale.
+			// The plan-time validator is lenient on unknown nested
+			// values so that legitimate `source_service =
+			// exoscale_dbaas.<primary>.name` references with a
+			// computed primary name still plan cleanly (Terraform
+			// normally resolves them by apply time via dependency
+			// ordering). But the plugin protocol does NOT guarantee
+			// unknowns will be resolved by the time createMysql
+			// runs, and ValueString() returns "" for unknowns —
+			// which would silently submit `source-service=""` to
+			// the Exoscale API. Reject the create cleanly instead.
+			for i, integration := range integrationModels {
+				if integration.Type.IsNull() || integration.Type.IsUnknown() {
+					diagnostics.AddError(
+						"mysql.integrations: element type is unknown or null at create time",
+						fmt.Sprintf(
+							"Element %d of the `mysql.integrations` set has no concrete "+
+								"`type` value at the time the service is being created. "+
+								"This usually means `type` depends on a computed value "+
+								"that Terraform could not resolve before the service create "+
+								"call. Set `type` to a literal value (currently only "+
+								"\"read_replica\" is supported).",
+							i,
+						),
+					)
+					return
+				}
+				if integration.SourceService.IsNull() || integration.SourceService.IsUnknown() {
+					diagnostics.AddError(
+						"mysql.integrations: source_service is unknown or null at create time",
+						fmt.Sprintf(
+							"Element %d of the `mysql.integrations` set has no concrete "+
+								"`source_service` value at the time the service is being "+
+								"created. This usually means `source_service` references a "+
+								"value that Terraform could not resolve before the create "+
+								"call — for example, a primary service whose name is itself "+
+								"computed from another resource that has not been applied "+
+								"yet. Ensure `source_service` references a plan-time-known "+
+								"value, typically `exoscale_dbaas.<primary>.name` where the "+
+								"primary's name is a literal or a fully-resolved expression.",
+							i,
+						),
+					)
+					return
+				}
+			}
 			if len(integrationModels) > 0 {
 				integrations := make([]struct {
 					DestService   *oapi.DbaasServiceName                               `json:"dest-service,omitempty"`
