@@ -620,6 +620,42 @@ func testResourcePgIntegrations(t *testing.T) {
 				),
 			},
 			{
+				// Out-of-band integration deletion: simulates an
+				// operator deleting the read_replica integration
+				// via the Exoscale dashboard (or another tool)
+				// while the exoscale_dbaas resource still exists
+				// in Terraform state. The PreConfig hook calls the
+				// DeleteDbaasIntegration API endpoint directly,
+				// then polls the service GET until the integration
+				// is no longer reported. RefreshState then re-reads
+				// state from the API (exercising the Read path's
+				// dest-filter on a now-missing integration), and
+				// the PostRefresh plancheck asserts Terraform
+				// proposes a full Replace of the replica — which
+				// is what the setRequiresReplace plan modifier
+				// should do when the integrations set in state
+				// diverges from the config. This closes the
+				// "out-of-band removal triggers forced replace on
+				// next plan" contract documented in the schema
+				// description.
+				//
+				// RefreshState (not PlanOnly) is used because
+				// RefreshPlanChecks.PostRefresh can run a
+				// plancheck against the resulting plan, whereas
+				// PlanOnly + ConfigPlanChecks.PreApply is
+				// explicitly forbidden by the test harness.
+				PreConfig: func() {
+					deletePgIntegrationOutOfBand(t, replica.Name, primary.Name)
+				},
+				RefreshState:       true,
+				ExpectNonEmptyPlan: true,
+				RefreshPlanChecks: resource.RefreshPlanChecks{
+					PostRefresh: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction(replicaFullResourceName, plancheck.ResourceActionReplace),
+					},
+				},
+			},
+			{
 				// Swapping source_service must force the replica to be
 				// replaced — verify via plancheck first, then assert the
 				// new integration is in place after apply.
@@ -640,6 +676,91 @@ func testResourcePgIntegrations(t *testing.T) {
 			},
 		},
 	})
+}
+
+// deletePgIntegrationOutOfBand calls the Exoscale DBaaS integration
+// delete API directly (bypassing Terraform), then polls the service
+// GET until the integration is no longer reported. Used to simulate
+// an operator removing an integration via the dashboard while the
+// exoscale_dbaas resource still exists in Terraform state.
+//
+// dest is the destination service (the replica); source is the
+// source service (the primary). The helper finds the integration
+// whose Dest matches dest and Source matches source, extracts its
+// ID, issues the delete, and waits up to 60s for the deletion to
+// become observable on the service GET endpoint.
+func deletePgIntegrationOutOfBand(t *testing.T, dest, source string) {
+	t.Helper()
+
+	client, err := testutils.APIClient()
+	if err != nil {
+		t.Fatalf("deletePgIntegrationOutOfBand: API client: %v", err)
+	}
+
+	// terraform-plugin-testing PreConfig callbacks have no context.
+	ctx := exoapi.WithEndpoint(context.Background(), exoapi.NewReqEndpoint(testutils.TestEnvironment(), testutils.TestZoneName))
+
+	getRes, err := client.GetDbaasServicePgWithResponse(ctx, oapi.DbaasServiceName(dest))
+	if err != nil {
+		t.Fatalf("deletePgIntegrationOutOfBand: GetDbaasServicePg: %v", err)
+	}
+	if getRes.StatusCode() != http.StatusOK {
+		t.Fatalf("deletePgIntegrationOutOfBand: GetDbaasServicePg unexpected status: %s", getRes.Status())
+	}
+	if getRes.JSON200.Integrations == nil {
+		t.Fatalf("deletePgIntegrationOutOfBand: service %q has no integrations", dest)
+	}
+
+	var integrationID string
+	for _, integration := range *getRes.JSON200.Integrations {
+		if integration.Dest == nil || integration.Source == nil || integration.Id == nil {
+			continue
+		}
+		if *integration.Dest == dest && *integration.Source == source {
+			integrationID = *integration.Id
+			break
+		}
+	}
+	if integrationID == "" {
+		t.Fatalf("deletePgIntegrationOutOfBand: no integration found with dest=%q source=%q on service %q", dest, source, dest)
+	}
+
+	delRes, err := client.DeleteDbaasIntegrationWithResponse(ctx, integrationID)
+	if err != nil {
+		t.Fatalf("deletePgIntegrationOutOfBand: DeleteDbaasIntegration(%s): %v", integrationID, err)
+	}
+	if delRes.StatusCode() != http.StatusOK && delRes.StatusCode() != http.StatusNoContent {
+		t.Fatalf("deletePgIntegrationOutOfBand: DeleteDbaasIntegration(%s) unexpected status: %s", integrationID, delRes.Status())
+	}
+
+	// Poll the service GET until the integration is no longer
+	// reported. The delete is async; we give it up to 60s.
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		if time.Now().After(deadline) {
+			t.Fatalf("deletePgIntegrationOutOfBand: timed out waiting for integration %s to disappear from service %q", integrationID, dest)
+		}
+		res, err := client.GetDbaasServicePgWithResponse(ctx, oapi.DbaasServiceName(dest))
+		if err != nil {
+			t.Fatalf("deletePgIntegrationOutOfBand: poll GetDbaasServicePg: %v", err)
+		}
+		if res.StatusCode() != http.StatusOK {
+			t.Fatalf("deletePgIntegrationOutOfBand: poll GetDbaasServicePg unexpected status: %s", res.Status())
+		}
+		stillPresent := false
+		if res.JSON200.Integrations != nil {
+			for _, integration := range *res.JSON200.Integrations {
+				if integration.Id != nil && *integration.Id == integrationID {
+					stillPresent = true
+					break
+				}
+			}
+		}
+		if !stillPresent {
+			return
+		}
+		time.Sleep(2 * time.Second)
+	}
 }
 
 // CheckPgIntegrationExists verifies that the DBaaS API reports an integration
@@ -808,6 +929,29 @@ resource "exoscale_dbaas" "target" {
       type           = "read_replica"
       source_service = %q
     }]`, serviceName)),
+				PlanOnly: true,
+				ExpectError: regexp.MustCompile(
+					`(?s)Invalid integration source`,
+				),
+			},
+			{
+				// Multi-element set: one valid integration and one
+				// self-sourced. The validator must iterate over all
+				// elements and still flag the bad one regardless of
+				// ordering (sets have no stable ordering anyway).
+				// This also exercises the ElementsAs() + loop machinery
+				// in the self-source validator for n > 1, which isn't
+				// covered by the single-element cases above.
+				Config: configWithIntegrations(serviceName, fmt.Sprintf(`integrations = [
+      {
+        type           = "read_replica"
+        source_service = "some-other-primary"
+      },
+      {
+        type           = "read_replica"
+        source_service = %q
+      },
+    ]`, serviceName)),
 				PlanOnly: true,
 				ExpectError: regexp.MustCompile(
 					`(?s)Invalid integration source`,
