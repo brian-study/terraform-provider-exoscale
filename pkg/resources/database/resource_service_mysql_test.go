@@ -44,6 +44,11 @@ type TemplateModelMysql struct {
 	Version        string
 
 	Integrations []TemplateModelMysqlIntegration
+
+	// DependsOn renders an explicit `depends_on = [...]` meta-argument.
+	// Each entry is emitted as-is in the HCL, so typical values look
+	// like "exoscale_dbaas.primary" (bare references, no quotes).
+	DependsOn []string
 }
 
 // TemplateModelMysqlIntegration renders a single `integrations` block entry
@@ -530,6 +535,18 @@ func testResourceMysqlIntegrations(t *testing.T) {
 	}
 	configSwap := renderMysqlConfig(primary, primary2, replicaSwapped)
 
+	// Variant for the P1 regression step: same topology as configSwap
+	// but the replica's HCL omits the `integrations` block entirely.
+	// Mirrors the pg test's P1 step — see the pg test for full
+	// rationale. depends_on is required because removing the
+	// source_service reference also removes the implicit dependency
+	// edge in Terraform's graph; without it, post-test destroy races
+	// primary2 against the replica.
+	replicaSwappedNoIntegrations := replicaSwapped
+	replicaSwappedNoIntegrations.Integrations = nil
+	replicaSwappedNoIntegrations.DependsOn = []string{"exoscale_dbaas.primary2"}
+	configSwapNoIntegrations := renderMysqlConfig(primary, primary2, replicaSwappedNoIntegrations)
+
 	primaryFullResourceName := "exoscale_dbaas.primary"
 	primary2FullResourceName := "exoscale_dbaas.primary2"
 	replicaFullResourceName := "exoscale_dbaas.replica"
@@ -606,6 +623,38 @@ func testResourceMysqlIntegrations(t *testing.T) {
 				},
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttrSet(primary2FullResourceName, "created_at"),
+					resource.TestCheckResourceAttr(replicaFullResourceName, "mysql.integrations.#", "1"),
+					integrationContains(primary2FullResourceName),
+					func(s *terraform.State) error {
+						return CheckMysqlIntegrationExists(replicaSwapped.Name, primary2.Name, "read_replica")
+					},
+				),
+			},
+			{
+				// P1 regression: omit `integrations` from the
+				// replica's config entirely. Mirrors the equivalent
+				// pg step — see testResourcePgIntegrations for full
+				// rationale. Verifies the Optional+Computed+
+				// UseStateForUnknown fix applies symmetrically to
+				// mysql: the plan action on the replica is Update
+				// (not Replace), and the post-apply state still
+				// carries the integration.
+				//
+				// ExpectNonEmptyPlan: true accounts for pre-existing
+				// drift on other Optional+Computed mysql attributes
+				// that lack UseStateForUnknown modifiers. The
+				// PreApply plancheck asserts Update (not Replace).
+				// The integrationsDependencyWarning plan modifier
+				// fires on this step — warnings do not fail the
+				// test assertions.
+				Config: configSwapNoIntegrations,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction(replicaFullResourceName, plancheck.ResourceActionUpdate),
+					},
+				},
+				ExpectNonEmptyPlan: true,
+				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr(replicaFullResourceName, "mysql.integrations.#", "1"),
 					integrationContains(primary2FullResourceName),
 					func(s *terraform.State) error {
