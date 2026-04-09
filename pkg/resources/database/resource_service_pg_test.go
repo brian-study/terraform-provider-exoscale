@@ -46,6 +46,11 @@ type TemplateModelPg struct {
 	Version           string
 
 	Integrations []TemplateModelPgIntegration
+
+	// DependsOn renders an explicit `depends_on = [...]` meta-argument.
+	// Each entry is emitted as-is in the HCL, so typical values look
+	// like "exoscale_dbaas.primary" (bare references, no quotes).
+	DependsOn []string
 }
 
 type TemplateModelPgIntegration struct {
@@ -542,6 +547,26 @@ func testResourcePgIntegrations(t *testing.T) {
 	}
 	configSwap := renderPgConfig(primary, primary2, replicaSwapped)
 
+	// Variant for the P1 regression step: same topology as configSwap
+	// but the replica's HCL omits the `integrations` block entirely.
+	// This simulates an operator who declares (or imports) a replica
+	// without mentioning integrations in config while the remote
+	// service still has one. With the Optional+Computed+UseStateForUnknown
+	// plan modifier, the plan must NOT fire RequiresReplace for
+	// integrations — the state value carries forward.
+	//
+	// An explicit `depends_on` is added because removing the
+	// `source_service = exoscale_dbaas.primary2.name` reference from
+	// HCL also removes the implicit dependency edge from Terraform's
+	// graph. Without it, the post-test destroy would try to delete
+	// primary2 in parallel with the replica and race against
+	// Exoscale's eventual-consistency on replica teardown, producing
+	// a "Cannot delete … while read replica exists" error.
+	replicaSwappedNoIntegrations := replicaSwapped
+	replicaSwappedNoIntegrations.Integrations = nil
+	replicaSwappedNoIntegrations.DependsOn = []string{"exoscale_dbaas.primary2"}
+	configSwapNoIntegrations := renderPgConfig(primary, primary2, replicaSwappedNoIntegrations)
+
 	primaryFullResourceName := "exoscale_dbaas.primary"
 	primary2FullResourceName := "exoscale_dbaas.primary2"
 	replicaFullResourceName := "exoscale_dbaas.replica"
@@ -667,6 +692,56 @@ func testResourcePgIntegrations(t *testing.T) {
 				},
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttrSet(primary2FullResourceName, "created_at"),
+					resource.TestCheckResourceAttr(replicaFullResourceName, "pg.integrations.#", "1"),
+					integrationContains(primary2FullResourceName),
+					func(s *terraform.State) error {
+						return CheckPgIntegrationExists(replicaSwapped.Name, primary2.Name, "read_replica")
+					},
+				),
+			},
+			{
+				// P1 regression: omit `integrations` from the
+				// replica's config entirely. Without the
+				// Optional+Computed+UseStateForUnknown fix, the
+				// plan modifier would see state=[{...}] and plan=
+				// null, fire RequiresReplace, and propose to
+				// destroy and recreate the replica — a data-loss
+				// trap for operators who imported (or refreshed
+				// after upgrading the provider) a replica that
+				// has an integration server-side but no HCL
+				// declaration of it. With the fix, UseStateForUnknown
+				// copies state into plan for integrations, so the
+				// proposed action is Update (not Replace) and the
+				// integration remains in state.
+				//
+				// Placed LAST in the test (after Swap) so that
+				// the out-of-band deletion step's RefreshState,
+				// which inherits the "prior step's config",
+				// continues to see configCreate rather than this
+				// no-integrations variant. The test's terminal
+				// state at this point has the replica pointing
+				// at primary2 with an integration, so we use
+				// configSwap as the baseline and strip
+				// integrations from the replica in a companion
+				// configSwapNoIntegrations variant.
+				//
+				// ExpectNonEmptyPlan: true accounts for
+				// pre-existing drift on other Optional+Computed
+				// pg attributes (node_cpus, pg_settings, ...)
+				// that lack UseStateForUnknown modifiers — that
+				// drift is out of scope for this PR. The
+				// PreApply plancheck asserts the action is
+				// Update (not Replace), and the Check asserts
+				// the integration is still present in state
+				// after apply.
+				Config: configSwapNoIntegrations,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction(replicaFullResourceName, plancheck.ResourceActionUpdate),
+					},
+				},
+				ExpectNonEmptyPlan: true,
+				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr(replicaFullResourceName, "pg.integrations.#", "1"),
 					integrationContains(primary2FullResourceName),
 					func(s *terraform.State) error {
@@ -956,6 +1031,72 @@ resource "exoscale_dbaas" "target" {
 				ExpectError: regexp.MustCompile(
 					`(?s)Invalid integration source`,
 				),
+			},
+		},
+	})
+}
+
+// testResourcePgIntegrationsUnknownSource verifies that the
+// integrationsSelfSource validator (and the underlying ElementsAs
+// decoding in createPg) do not produce a spurious plan-time error
+// when an integration element's source_service references a computed
+// attribute of another resource that has not been applied yet. In
+// that case the plan-time value of source_service is unknown, and
+// the validator must skip the element rather than fail the plan.
+//
+// Plan-only test using two exoscale_dbaas resources in the same
+// config. At plan time neither exists yet, so primary.id (a
+// Computed attribute) is unknown, and so is the replica's
+// integrations[*].source_service. Zero API cost — the plan is
+// computed locally and never applied.
+func testResourcePgIntegrationsUnknownSource(t *testing.T) {
+	t.Parallel()
+
+	primaryName := acctest.RandomWithPrefix(testutils.Prefix)
+	replicaName := acctest.RandomWithPrefix(testutils.Prefix)
+	config := fmt.Sprintf(`
+resource "exoscale_dbaas" "p2_primary" {
+  name                   = %q
+  type                   = "pg"
+  plan                   = "business-4"
+  zone                   = %q
+  termination_protection = false
+  pg = {
+    version = "15"
+  }
+}
+
+resource "exoscale_dbaas" "p2_replica" {
+  name                   = %q
+  type                   = "pg"
+  plan                   = "startup-4"
+  zone                   = %q
+  termination_protection = false
+  pg = {
+    version = "15"
+    integrations = [{
+      type = "read_replica"
+      # id is Computed, unknown until p2_primary is applied. The
+      # validator must skip the element instead of erroring.
+      source_service = exoscale_dbaas.p2_primary.id
+    }]
+  }
+}
+`, primaryName, testutils.TestZoneName, replicaName, testutils.TestZoneName)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testutils.AccPreCheck(t) },
+		ProtoV6ProviderFactories: testutils.TestAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				// PlanOnly + ExpectNonEmptyPlan: true. ExpectError
+				// is intentionally NOT set — the whole point is
+				// that this config must plan cleanly. If the
+				// validator (or the ElementsAs decoding) errors
+				// on the unknown nested field, the test fails.
+				Config:             config,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
 			},
 		},
 	})

@@ -153,7 +153,12 @@ func (r *ServiceResource) createMysql(ctx context.Context, data *ServiceResource
 
 		if !data.Mysql.Integrations.IsNull() && !data.Mysql.Integrations.IsUnknown() {
 			var integrationModels []ResourceDbaasIntegrationModel
-			if dg := data.Mysql.Integrations.ElementsAs(ctx, &integrationModels, false); dg.HasError() {
+			// allowUnhandled=true so unknown per-field values in the
+			// set (e.g. source_service pointing at a computed
+			// attribute of another resource that is unknown at
+			// plan time) do not produce a hard decoding error.
+			// See resource_service_pg.go for the full rationale.
+			if dg := data.Mysql.Integrations.ElementsAs(ctx, &integrationModels, true); dg.HasError() {
 				diagnostics.Append(dg...)
 				return
 			}
@@ -292,6 +297,36 @@ pooling:
 				return
 			}
 			data.Mysql.Settings = types.StringValue(string(settings))
+		}
+	}
+
+	// Integrations is Optional+Computed: if the operator did not set
+	// the attribute in config, the framework left the plan value
+	// unknown at the Create phase. Populate it from the API response
+	// so the post-create state has a concrete value. Only surface
+	// integrations where the current service is the destination,
+	// matching readMysql's filter.
+	if data.Mysql.Integrations.IsUnknown() {
+		data.Mysql.Integrations = types.SetNull(resourceDbaasIntegrationObjectType)
+		if apiService.Integrations != nil {
+			var models []ResourceDbaasIntegrationModel
+			for _, integration := range *apiService.Integrations {
+				if integration.Dest == nil || *integration.Dest != data.Id.ValueString() {
+					continue
+				}
+				models = append(models, ResourceDbaasIntegrationModel{
+					Type:          types.StringPointerValue(integration.Type),
+					SourceService: types.StringPointerValue(integration.Source),
+				})
+			}
+			if len(models) > 0 {
+				v, dg := types.SetValueFrom(ctx, resourceDbaasIntegrationObjectType, models)
+				if dg.HasError() {
+					diagnostics.Append(dg...)
+					return
+				}
+				data.Mysql.Integrations = v
+			}
 		}
 	}
 }

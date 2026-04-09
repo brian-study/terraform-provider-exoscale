@@ -10,9 +10,61 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 )
 
-// Compile-time assertion that setRequiresReplaceModifier satisfies the
-// planmodifier.Set interface.
-var _ planmodifier.Set = setRequiresReplaceModifier{}
+// Compile-time assertion that setRequiresReplaceModifier and
+// setUseStateForUnknownModifier satisfy the planmodifier.Set interface.
+var (
+	_ planmodifier.Set = setRequiresReplaceModifier{}
+	_ planmodifier.Set = setUseStateForUnknownModifier{}
+)
+
+// setUseStateForUnknownModifier copies the state value into the plan when
+// the plan is unknown and the attribute is not set in config. This is the
+// canonical pattern for Optional+Computed attributes whose value should
+// persist across refresh cycles even if the operator omits them from
+// configuration.
+//
+// Equivalent to the upstream `setplanmodifier.UseStateForUnknown` helper,
+// which is not vendored in this repository (only the stringplanmodifier,
+// boolplanmodifier, and int64planmodifier helpers are).
+type setUseStateForUnknownModifier struct{}
+
+// setUseStateForUnknown returns a plan modifier that copies the state
+// value into an unknown plan value. Use this on Optional+Computed set
+// attributes where the provider reads the value from the remote API and
+// operators may legitimately omit the attribute from config (e.g. after
+// importing a resource).
+func setUseStateForUnknown() planmodifier.Set {
+	return setUseStateForUnknownModifier{}
+}
+
+func (m setUseStateForUnknownModifier) Description(_ context.Context) string {
+	return "Once set, the value of this attribute in state will not change unless it is explicitly modified in configuration."
+}
+
+func (m setUseStateForUnknownModifier) MarkdownDescription(ctx context.Context) string {
+	return m.Description(ctx)
+}
+
+func (m setUseStateForUnknownModifier) PlanModifySet(_ context.Context, req planmodifier.SetRequest, resp *planmodifier.SetResponse) {
+	// Nothing to fall back on if there is no state value.
+	if req.StateValue.IsNull() {
+		return
+	}
+
+	// Do nothing if the plan already has a known value. This means the
+	// operator set the attribute in config; their value takes precedence.
+	if !req.PlanValue.IsUnknown() {
+		return
+	}
+
+	// Do nothing if the config value itself is unknown — otherwise
+	// we would clobber an interpolation that will resolve during apply.
+	if req.ConfigValue.IsUnknown() {
+		return
+	}
+
+	resp.PlanValue = req.StateValue
+}
 
 // setRequiresReplaceModifier is a plan modifier that triggers resource
 // replacement whenever a set attribute changes.
@@ -103,14 +155,29 @@ func (v integrationsSelfSourceValidator) ValidateSet(ctx context.Context, req va
 		return
 	}
 
+	// allowUnhandled=true so elements whose nested string fields are
+	// unknown at plan time (e.g. source_service pointing at a
+	// computed attribute of another resource that has not been
+	// applied yet) do not cause a hard decoding error. The loop
+	// below skips individual elements whose type or source_service
+	// is still unknown, deferring validation to the next plan once
+	// the values are resolved.
 	var models []ResourceDbaasIntegrationModel
-	if diags := req.ConfigValue.ElementsAs(ctx, &models, false); diags.HasError() {
+	if diags := req.ConfigValue.ElementsAs(ctx, &models, true); diags.HasError() {
 		resp.Diagnostics.Append(diags...)
 		return
 	}
 
 	for _, m := range models {
+		// Skip elements whose source_service or type is unknown at
+		// plan time. The validator will be re-run during the next
+		// plan once the interpolation resolves; skipping now
+		// avoids false positives on valid configurations that
+		// reference computed attributes of other resources.
 		if m.SourceService.IsNull() || m.SourceService.IsUnknown() {
+			continue
+		}
+		if m.Type.IsNull() || m.Type.IsUnknown() {
 			continue
 		}
 		if m.SourceService.ValueString() == selfName.ValueString() {

@@ -121,14 +121,25 @@ var ResourcePgSchema = schema.SingleNestedAttribute{
 // in place, therefore changing it forces resource replacement. It is
 // modelled as a set so reordering by the API (on Read) doesn't produce
 // spurious plans.
+//
+// The attribute is Optional+Computed with a `UseStateForUnknown` plan
+// modifier so that an operator who omits the attribute from config (most
+// commonly after importing a pre-existing replica service) does not see
+// Terraform propose a destructive replace simply because the API reports
+// an integration that the HCL doesn't mention. The plan value falls back
+// to the state value in that case, producing a no-op plan. The
+// `RequiresReplace` modifier still fires when the operator actively
+// changes a configured integration.
 var ResourceDbaasIntegrationsSchema = schema.SetNestedAttribute{
-	MarkdownDescription: "❗ Service integrations declared when the service is created. Only integrations where **this** resource is the destination are supported: for example, to create a PostgreSQL read replica, declare the `integrations` block on the replica (destination) and set `source_service` to the primary's name. Integrations cannot be updated in place — any change to this set destroys and recreates the service (including all data). Removing an integration out-of-band (e.g. via the Exoscale dashboard) will also trigger a forced replace on the next plan.",
+	MarkdownDescription: "❗ Service integrations declared when the service is created. Only integrations where **this** resource is the destination are supported: for example, to create a PostgreSQL read replica, declare the `integrations` block on the replica (destination) and set `source_service` to the primary's name. Integrations cannot be updated in place — any change to this set destroys and recreates the service (including all data). Omitting the attribute on an imported or pre-existing replica is safe: the value is then read from the API and used as-is without triggering a replace. Removing an integration out-of-band (e.g. via the Exoscale dashboard) on a resource that explicitly declares the attribute in config will still trigger a forced replace on the next plan.",
 	Optional:            true,
+	Computed:            true,
 	Validators: []validator.Set{
 		setvalidator.SizeAtLeast(1),
 		integrationsSelfSource(),
 	},
 	PlanModifiers: []planmodifier.Set{
+		setUseStateForUnknown(),
 		setRequiresReplace(),
 	},
 	NestedObject: schema.NestedAttributeObject{
@@ -245,7 +256,14 @@ func (r *ServiceResource) createPg(ctx context.Context, data *ServiceResourceMod
 
 		if !data.Pg.Integrations.IsNull() && !data.Pg.Integrations.IsUnknown() {
 			var integrationModels []ResourceDbaasIntegrationModel
-			if dg := data.Pg.Integrations.ElementsAs(ctx, &integrationModels, false); dg.HasError() {
+			// allowUnhandled=true so unknown per-field values in the
+			// set (e.g. source_service pointing at a computed
+			// attribute of another resource that is unknown at
+			// plan time) do not produce a hard decoding error.
+			// types.String already represents unknown natively so
+			// this is mostly defense-in-depth, but it also
+			// matches the validator's behavior for consistency.
+			if dg := data.Pg.Integrations.ElementsAs(ctx, &integrationModels, true); dg.HasError() {
 				diagnostics.Append(dg...)
 				return
 			}
@@ -407,6 +425,36 @@ pooling:
 				return
 			}
 			data.Pg.PglookoutSettings = types.StringValue(string(settings))
+		}
+	}
+
+	// Integrations is Optional+Computed: if the operator did not set
+	// the attribute in config, the framework left the plan value
+	// unknown at the Create phase. Populate it from the API response
+	// so the post-create state has a concrete value. Only surface
+	// integrations where the current service is the destination,
+	// matching readPg's filter.
+	if data.Pg.Integrations.IsUnknown() {
+		data.Pg.Integrations = types.SetNull(resourceDbaasIntegrationObjectType)
+		if apiService.Integrations != nil {
+			var models []ResourceDbaasIntegrationModel
+			for _, integration := range *apiService.Integrations {
+				if integration.Dest == nil || *integration.Dest != data.Id.ValueString() {
+					continue
+				}
+				models = append(models, ResourceDbaasIntegrationModel{
+					Type:          types.StringPointerValue(integration.Type),
+					SourceService: types.StringPointerValue(integration.Source),
+				})
+			}
+			if len(models) > 0 {
+				v, dg := types.SetValueFrom(ctx, resourceDbaasIntegrationObjectType, models)
+				if dg.HasError() {
+					diagnostics.Append(dg...)
+					return
+				}
+				data.Pg.Integrations = v
+			}
 		}
 	}
 }

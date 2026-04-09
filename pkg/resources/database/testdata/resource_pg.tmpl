@@ -4,6 +4,14 @@ resource "exoscale_dbaas" {{ .ResourceName }} {
   plan = "{{ .Plan }}"
   zone = "{{ .Zone }}"
 
+  {{- if .DependsOn }}
+  depends_on = [
+  {{- range $k, $v := .DependsOn }}
+    {{ $v }},
+  {{- end }}
+  ]
+  {{- end }}
+
   {{- if .MaintenanceDow }}
   maintenance_dow = "{{ .MaintenanceDow }}"
   {{- end }}
