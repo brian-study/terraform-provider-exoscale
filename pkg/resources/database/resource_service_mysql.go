@@ -75,7 +75,10 @@ var ResourceMysqlSchema = schema.SingleNestedAttribute{
 }
 
 // createMysql function handles MySQL specific part of database resource creation logic.
-func (r *ServiceResource) createMysql(ctx context.Context, data *ServiceResourceModel, diagnostics *diag.Diagnostics) {
+// configData carries the raw configuration so we can distinguish "operator
+// omitted integrations" (config null) from "operator set integrations to an
+// unknown expression" (config non-null but plan unknown).
+func (r *ServiceResource) createMysql(ctx context.Context, data *ServiceResourceModel, configData *ServiceResourceModel, diagnostics *diag.Diagnostics) {
 	service := oapi.CreateDbaasServiceMysqlJSONRequestBody{
 		Plan:                  data.Plan.ValueString(),
 		TerminationProtection: data.TerminationProtection.ValueBoolPointer(),
@@ -152,6 +155,20 @@ func (r *ServiceResource) createMysql(ctx context.Context, data *ServiceResource
 			service.MysqlSettings = &obj
 		}
 
+		// P2: See createPg for the full rationale.
+		if data.Mysql.Integrations.IsUnknown() && configData.Mysql != nil && !configData.Mysql.Integrations.IsNull() {
+			diagnostics.AddError(
+				"mysql.integrations: entire integrations set is unknown at create time",
+				"The `integrations` attribute was set in configuration but its value "+
+					"is still unknown at apply time. This usually means the entire set is "+
+					"derived from a resource output that Terraform could not resolve before "+
+					"creating this service. Set `integrations` to a list of objects with "+
+					"known `type` and `source_service` values, for example:\n\n"+
+					"  integrations = [{ type = \"read_replica\", source_service = exoscale_dbaas.<primary>.name }]",
+			)
+			return
+		}
+
 		if !data.Mysql.Integrations.IsNull() && !data.Mysql.Integrations.IsUnknown() {
 			var integrationModels []ResourceDbaasIntegrationModel
 			// allowUnhandled=true so unknown per-field values in the
@@ -164,16 +181,6 @@ func (r *ServiceResource) createMysql(ctx context.Context, data *ServiceResource
 				return
 			}
 			// Defensive check: see createPg for the full rationale.
-			// The plan-time validator is lenient on unknown nested
-			// values so that legitimate `source_service =
-			// exoscale_dbaas.<primary>.name` references with a
-			// computed primary name still plan cleanly (Terraform
-			// normally resolves them by apply time via dependency
-			// ordering). But the plugin protocol does NOT guarantee
-			// unknowns will be resolved by the time createMysql
-			// runs, and ValueString() returns "" for unknowns —
-			// which would silently submit `source-service=""` to
-			// the Exoscale API. Reject the create cleanly instead.
 			for i, integration := range integrationModels {
 				if integration.Type.IsNull() || integration.Type.IsUnknown() {
 					diagnostics.AddError(
@@ -204,6 +211,46 @@ func (r *ServiceResource) createMysql(ctx context.Context, data *ServiceResource
 								"value, typically `exoscale_dbaas.<primary>.name` where the "+
 								"primary's name is a literal or a fully-resolved expression.",
 							i,
+						),
+					)
+					return
+				}
+			}
+			// P3: Re-run semantic checks that the plan-time validators
+			// skipped for unknown nested values. See createPg for the
+			// full rationale.
+			selfName := data.Name.ValueString()
+			for i, integration := range integrationModels {
+				typeVal := integration.Type.ValueString()
+				supported := false
+				for _, t := range supportedIntegrationTypes {
+					if typeVal == t {
+						supported = true
+						break
+					}
+				}
+				if !supported {
+					diagnostics.AddError(
+						"mysql.integrations: unsupported integration type",
+						fmt.Sprintf(
+							"Element %d of the `mysql.integrations` set has type %q, "+
+								"which is not a supported integration type. "+
+								"Supported types: %s.",
+							i, typeVal, strings.Join(supportedIntegrationTypes, ", "),
+						),
+					)
+					return
+				}
+				if integration.SourceService.ValueString() == selfName {
+					diagnostics.AddError(
+						"mysql.integrations: self-referencing source_service",
+						fmt.Sprintf(
+							"Element %d of the `mysql.integrations` set has "+
+								"source_service=%q, which is the same service this "+
+								"resource declares. Integrations must be declared on "+
+								"the destination side, with source_service pointing "+
+								"at a different service.",
+							i, selfName,
 						),
 					)
 					return

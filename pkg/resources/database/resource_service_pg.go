@@ -196,7 +196,10 @@ var ResourceDbaasIntegrationsSchema = schema.SetNestedAttribute{
 }
 
 // createPg function handles PostgreSQL specific part of database resource creation logic.
-func (r *ServiceResource) createPg(ctx context.Context, data *ServiceResourceModel, diagnostics *diag.Diagnostics) {
+// configData carries the raw configuration so we can distinguish "operator
+// omitted integrations" (config null) from "operator set integrations to an
+// unknown expression" (config non-null but plan unknown).
+func (r *ServiceResource) createPg(ctx context.Context, data *ServiceResourceModel, configData *ServiceResourceModel, diagnostics *diag.Diagnostics) {
 	service := oapi.CreateDbaasServicePgJSONRequestBody{
 		Plan:                  data.Plan.ValueString(),
 		TerminationProtection: data.TerminationProtection.ValueBoolPointer(),
@@ -290,6 +293,24 @@ func (r *ServiceResource) createPg(ctx context.Context, data *ServiceResourceMod
 			service.PglookoutSettings = &obj
 		}
 
+		// P2: If the operator explicitly set integrations in config but
+		// the entire set is still unknown at apply time (e.g.
+		// `integrations = terraform_data.x.output`), reject cleanly.
+		// When the config value is null the operator omitted the
+		// attribute, which is correct for a standalone service.
+		if data.Pg.Integrations.IsUnknown() && configData.Pg != nil && !configData.Pg.Integrations.IsNull() {
+			diagnostics.AddError(
+				"pg.integrations: entire integrations set is unknown at create time",
+				"The `integrations` attribute was set in configuration but its value "+
+					"is still unknown at apply time. This usually means the entire set is "+
+					"derived from a resource output that Terraform could not resolve before "+
+					"creating this service. Set `integrations` to a list of objects with "+
+					"known `type` and `source_service` values, for example:\n\n"+
+					"  integrations = [{ type = \"read_replica\", source_service = exoscale_dbaas.<primary>.name }]",
+			)
+			return
+		}
+
 		if !data.Pg.Integrations.IsNull() && !data.Pg.Integrations.IsUnknown() {
 			var integrationModels []ResourceDbaasIntegrationModel
 			// allowUnhandled=true so unknown per-field values in the
@@ -349,6 +370,47 @@ func (r *ServiceResource) createPg(ctx context.Context, data *ServiceResourceMod
 								"value, typically `exoscale_dbaas.<primary>.name` where the "+
 								"primary's name is a literal or a fully-resolved expression.",
 							i,
+						),
+					)
+					return
+				}
+			}
+			// P3: Re-run semantic checks that the plan-time validators
+			// skipped for unknown nested values. Now that all fields are
+			// concrete, verify type ∈ supportedIntegrationTypes and
+			// source_service ≠ self.name.
+			selfName := data.Name.ValueString()
+			for i, integration := range integrationModels {
+				typeVal := integration.Type.ValueString()
+				supported := false
+				for _, t := range supportedIntegrationTypes {
+					if typeVal == t {
+						supported = true
+						break
+					}
+				}
+				if !supported {
+					diagnostics.AddError(
+						"pg.integrations: unsupported integration type",
+						fmt.Sprintf(
+							"Element %d of the `pg.integrations` set has type %q, "+
+								"which is not a supported integration type. "+
+								"Supported types: %s.",
+							i, typeVal, strings.Join(supportedIntegrationTypes, ", "),
+						),
+					)
+					return
+				}
+				if integration.SourceService.ValueString() == selfName {
+					diagnostics.AddError(
+						"pg.integrations: self-referencing source_service",
+						fmt.Sprintf(
+							"Element %d of the `pg.integrations` set has "+
+								"source_service=%q, which is the same service this "+
+								"resource declares. Integrations must be declared on "+
+								"the destination side, with source_service pointing "+
+								"at a different service.",
+							i, selfName,
 						),
 					)
 					return
