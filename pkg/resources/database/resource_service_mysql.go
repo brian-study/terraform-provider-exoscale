@@ -155,7 +155,8 @@ func (r *ServiceResource) createMysql(ctx context.Context, data *ServiceResource
 			service.MysqlSettings = &obj
 		}
 
-		// P2: See createPg for the full rationale.
+		// P2: See createPg for the full rationale. Likely unreachable
+		// for the current schema shape but guards against future changes.
 		if data.Mysql.Integrations.IsUnknown() && configData.Mysql != nil && !configData.Mysql.Integrations.IsNull() {
 			diagnostics.AddError(
 				"mysql.integrations: entire integrations set is unknown at create time",
@@ -180,7 +181,9 @@ func (r *ServiceResource) createMysql(ctx context.Context, data *ServiceResource
 				diagnostics.Append(dg...)
 				return
 			}
-			// Defensive check: see createPg for the full rationale.
+			// Single-pass validation: null/unknown rejection + semantic
+			// re-checks. See createPg for the full rationale.
+			selfName := data.Name.ValueString()
 			for i, integration := range integrationModels {
 				if integration.Type.IsNull() || integration.Type.IsUnknown() {
 					diagnostics.AddError(
@@ -215,12 +218,6 @@ func (r *ServiceResource) createMysql(ctx context.Context, data *ServiceResource
 					)
 					return
 				}
-			}
-			// P3: Re-run semantic checks that the plan-time validators
-			// skipped for unknown nested values. See createPg for the
-			// full rationale.
-			selfName := data.Name.ValueString()
-			for i, integration := range integrationModels {
 				typeVal := integration.Type.ValueString()
 				supported := false
 				for _, t := range supportedIntegrationTypes {

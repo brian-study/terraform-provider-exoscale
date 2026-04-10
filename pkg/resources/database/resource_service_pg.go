@@ -294,10 +294,14 @@ func (r *ServiceResource) createPg(ctx context.Context, data *ServiceResourceMod
 		}
 
 		// P2: If the operator explicitly set integrations in config but
-		// the entire set is still unknown at apply time (e.g.
-		// `integrations = terraform_data.x.output`), reject cleanly.
+		// the entire set is still unknown at apply time, reject cleanly.
 		// When the config value is null the operator omitted the
 		// attribute, which is correct for a standalone service.
+		//
+		// Note: this is likely unreachable for the current schema shape
+		// (SetNestedAttribute with Required string children cannot be
+		// assigned from a scalar unknown), but it guards against future
+		// schema changes or unexpected framework behavior.
 		if data.Pg.Integrations.IsUnknown() && configData.Pg != nil && !configData.Pg.Integrations.IsNull() {
 			diagnostics.AddError(
 				"pg.integrations: entire integrations set is unknown at create time",
@@ -324,22 +328,15 @@ func (r *ServiceResource) createPg(ctx context.Context, data *ServiceResourceMod
 				diagnostics.Append(dg...)
 				return
 			}
-			// Defensive check: the attribute-level validator is
-			// lenient about unknown nested values at plan time
-			// because interpolations like
-			// `source_service = exoscale_dbaas.<primary>.name`
-			// (where the primary's name is itself computed from
-			// e.g. a random_id) are normally resolved by the
-			// time `createPg` runs, thanks to Terraform's
-			// dependency ordering. But the plugin protocol does
-			// NOT guarantee this: per tfprotov6 documentation,
-			// "any unknown values may remain unknown" in the
-			// apply-time planned state. If that happens,
-			// `types.String.ValueString()` returns "" for
-			// unknown values, and we would silently submit
-			// `source-service=""` to the Exoscale API, which
-			// then fails with an opaque error. Reject the
-			// create cleanly instead.
+			// Validate every element in a single pass:
+			//  1. Reject null/unknown fields — the plan-time validator
+			//     is lenient about unknowns, but by apply time
+			//     ValueString() would return "" for unknowns and we'd
+			//     silently submit source-service="" to the API.
+			//  2. Re-run the semantic checks (type ∈ supported, source
+			//     ≠ self) that plan-time validators skipped for unknown
+			//     nested values.
+			selfName := data.Name.ValueString()
 			for i, integration := range integrationModels {
 				if integration.Type.IsNull() || integration.Type.IsUnknown() {
 					diagnostics.AddError(
@@ -374,13 +371,6 @@ func (r *ServiceResource) createPg(ctx context.Context, data *ServiceResourceMod
 					)
 					return
 				}
-			}
-			// P3: Re-run semantic checks that the plan-time validators
-			// skipped for unknown nested values. Now that all fields are
-			// concrete, verify type ∈ supportedIntegrationTypes and
-			// source_service ≠ self.name.
-			selfName := data.Name.ValueString()
-			for i, integration := range integrationModels {
 				typeVal := integration.Type.ValueString()
 				supported := false
 				for _, t := range supportedIntegrationTypes {

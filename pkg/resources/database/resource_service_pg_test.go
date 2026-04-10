@@ -941,11 +941,10 @@ func assertImportedIntegrations(dbType, expectedType string, expectedSourceName 
 		}
 
 		want := *expectedSourceName
-		for hash, fields := range seen {
+		for _, fields := range seen {
 			if fields["type"] == expectedType && fields["source_service"] == want {
 				return nil
 			}
-			_ = hash
 		}
 		return fmt.Errorf(
 			"imported state has no %s.integrations element with type=%q source_service=%q; got %d element(s): %+v",
