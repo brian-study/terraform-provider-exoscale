@@ -602,7 +602,7 @@ func (r *ServiceResource) updateMysql(ctx context.Context, stateData *ServiceRes
 			stateData.Mysql = &ResourceMysqlModel{}
 		}
 
-		if !planData.Mysql.BackupSchedule.Equal(stateData.Mysql.BackupSchedule) {
+		if !planData.Mysql.BackupSchedule.IsUnknown() && !planData.Mysql.BackupSchedule.Equal(stateData.Mysql.BackupSchedule) {
 			bh, bm, err := parseBackupSchedule(planData.Mysql.BackupSchedule.ValueString())
 			if err != nil {
 				diagnostics.AddError("Validation error", fmt.Sprintf("Unable to parse backup schedule, got error: %s", err))
@@ -670,8 +670,8 @@ func (r *ServiceResource) updateMysql(ctx context.Context, stateData *ServiceRes
 	}
 
 	// Aiven would overwrite the backup schedule with random value if we don't specify it explicitly every time.
-	if service.BackupSchedule == nil {
-		bh, bm, err := parseBackupSchedule(planData.Mysql.BackupSchedule.ValueString())
+	if service.BackupSchedule == nil && !stateData.Mysql.BackupSchedule.IsUnknown() {
+		bh, bm, err := parseBackupSchedule(stateData.Mysql.BackupSchedule.ValueString())
 		if err != nil {
 			diagnostics.AddError("Validation error", fmt.Sprintf("Unable to parse backup schedule, got error: %s", err))
 			return
